@@ -1,36 +1,52 @@
-# llm-router configuration (copy to config.yaml, then `python run.py`)
-# Keys support ${ENV_VAR} or ${ENV_VAR:default} expansion.
+# llm-router v0.1 - copy to config.yaml and fill in your keys.
+# Secrets stay out of the file: ${ENV_VAR} is expanded from the environment.
 
-master_keys:
-  - ${LLMROUTER_KEY:sk-local-dev}   # clients must send: Authorization: Bearer <key>
-anon_allowed: false                  # true = no auth required (local experiments)
-max_retries: 3
-cooldown: 30                         # seconds a failing key is parked
+listen: 127.0.0.1:8000          # host:port the gateway binds
+master_keys:                    # client-facing keys ("sk-router-..."); empty = no auth
+  - ${ROUTER_MASTER_KEY}
+strategy: priority              # priority | round_robin | weighted
+retry: 2                        # extra attempts after the first failure
+cooldown: 60                    # seconds a failing key is skipped
+db_path: usage.sqlite3          # call log for /stats + dashboard
+log_level: INFO
 
 providers:
-  openrouter:
-    base_url: https://openrouter.ai/api/v1
-    api_keys:                        # key pool: round-robin + auto cooldown
-      - ${OPENROUTER_API_KEY_1}
-      - ${OPENROUTER_API_KEY_2}
-    weight: 2
-    models:
-      - openai/gpt-4o-mini
-      - anthropic/claude-3.5-sonnet
-  deepseek:
-    base_url: https://api.deepseek.com/v1
-    api_keys: [${DEEPSEEK_API_KEY}]
-    models: [deepseek-chat, deepseek-reasoner]
-  ollama:
-    base_url: http://127.0.0.1:11434/v1
-    api_keys: [ollama]               # local model, free tier traffic
-    models: [qwen2.5:7b-instruct]
+  - name: openai
+    base_url: https://api.openai.com/v1
+    keys:
+      - ${OPENAI_API_KEY}
+      # - ${OPENAI_API_KEY_2}     # add more keys -> automatic rotation + 401/429 cooldown
+    models:                      # public alias: upstream model id
+      gpt-4o-mini: gpt-4o-mini
+      gpt-4o: gpt-4o
+    priority: 10                 # preferred provider
+    weight: 3                    # used by strategy=weighted
+    timeout: 120
+    max_rpm: 0                   # 0 = unlimited; per-slot requests/minute cap
 
-# public name -> ordered fallback chain (provider/model)
-routes:
-  gpt-4o-mini:
-    - openrouter/openai/gpt-4o-mini
-    - deepseek/deepseek-chat
-  chat:
-    - deepseek/deepseek-chat
-    - ollama/qwen2.5:7b-instruct
+  - name: openai-compatible      # any OpenAI-shaped endpoint (DeepSeek, Moonshot, vLLM...)
+    base_url: https://api.deepseek.com/v1
+    keys:
+      - ${DEEPSEEK_API_KEY}
+    models:
+      deepseek-chat: deepseek-chat
+    priority: 5
+
+  - name: anthropic              # native Anthropic API, exposed as OpenAI chat format
+    base_url: https://api.anthropic.com
+    style: anthropic
+    keys:
+      - ${ANTHROPIC_API_KEY}
+    models:
+      claude-3-5-sonnet: claude-3-5-sonnet-latest
+    extra_headers:
+      anthropic-version: "2023-06-01"
+    priority: 1
+
+  - name: fallback               # same alias served elsewhere -> automatic failover
+    base_url: https://api.openai.com/v1
+    keys:
+      - ${OPENAI_BACKUP_KEY}
+    models:
+      gpt-4o-mini: gpt-4o-mini
+    enabled: false               # flip to true to activate
