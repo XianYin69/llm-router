@@ -50,6 +50,18 @@ async def chat(request: Request):
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
 
 
+@app.post("/v1/embeddings")
+async def embeddings(request: Request):
+    if _denied(request):
+        return JSONResponse({"error": {"message": "invalid api key"}}, status_code=401)
+    payload = await request.json()
+    inp = payload.get("input")
+    texts = inp if isinstance(inp, list) else [str(inp)]
+    vec = [0.1, 0.2, 0.3]
+    return {"object": "list", "model": payload.get("model"),
+            "data": [{"object": "embedding", "index": i, "embedding": vec}
+                     for i in range(len(texts))],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4}}
 @app.post("/v1/messages")
 async def messages(request: Request):
     if _denied(request):

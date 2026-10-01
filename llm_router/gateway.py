@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -43,7 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await st.http.aclose()
         st.usage.close()
 
-    app = FastAPI(title="llm-router", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="llm-router", version="0.2.0", lifespan=lifespan)
     app.state.llm = st
 
     def authorize(request: Request) -> None:
@@ -66,10 +67,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/models", dependencies=dep)
     async def models():
-        idx = st.settings.model_index()
-        return {"object": "list", "data": [
-            {"id": a, "object": "model", "created": 0,
-             "owned_by": ",".join(sorted({p.name for p in idx[a]}))} for a in sorted(idx)]}
+        idx, eidx = st.settings.model_index(), st.settings.embed_index()
+        data = [{"id": a, "object": "model", "created": 0,
+                 "owned_by": ",".join(sorted({p.name for p in idx[a]}))} for a in sorted(idx)]
+        data += [{"id": a, "object": "model", "created": 0,
+                  "owned_by": ",".join(sorted({p.name for p in eidx[a]}))} for a in sorted(eidx)]
+        return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions", dependencies=dep)
     async def chat(request: Request):
@@ -99,7 +102,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         s = st.usage.summary()
         return {"by_provider": s["providers"], "by_model": s["models"],
                 "calls": s["total"]["c"], "tokens": s["total"]["t"] or 0,
+                "cost": s["total"]["cost"] or 0, "currency": st.settings.currency,
                 "recent": st.usage.recent(30)}
+    @app.get("/v1/usage", dependencies=dep)
+    async def usage(days: int = 14):
+        s = st.usage.summary()
+        return {"currency": st.settings.currency,
+                "totals": {"calls": s["total"]["c"], "tokens": s["total"]["t"] or 0,
+                           "cost": s["total"]["cost"] or 0},
+                "by_provider": s["providers"], "by_model": s["models"],
+                "daily": st.usage.daily(max(1, min(days, 365)))}
+    @app.post("/v1/embeddings", dependencies=dep)
+    async def embeddings(request: Request):
+        payload = await request.json()
+        alias = str(payload.get("model") or "")
+        if not alias:
+            raise HTTPException(400, detail={"error": {"message": "model is required"}})
+        try:
+            return JSONResponse(await st.router.embeddings(payload))
+        except NoUpstream as e:
+            raise HTTPException(404, detail={"error": {"message": str(e), "type": "invalid_request_error"}})
+        except UpstreamError as e:
+            raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
+                                                            "type": "upstream_error"}})
 
     @app.get("/pool")
     async def pool():
@@ -112,9 +137,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/admin/reload", dependencies=dep)
     async def reload_config():
-        st.settings = load_config(os.environ.get("LLMROUTER_CONFIG", "config.yaml"))
-        st.pool = Pool(st.settings.providers)
+        # Never swap in an empty/broken config: a bad reload must leave live state intact.
+        path = os.environ.get("LLMROUTER_CONFIG", "config.yaml")
+        if not Path(path).exists():
+            raise HTTPException(409, detail={"error": {
+                "message": f"config not found: {path}", "type": "invalid_request_error"}})
+        try:
+            new = load_config(path)
+        except Exception as exc:
+            raise HTTPException(400, detail={"error": {
+                "message": f"config rejected: {exc}", "type": "invalid_request_error"}})
+        if not new.providers:
+            raise HTTPException(409, detail={"error": {
+                "message": "config has no providers, refusing to reload",
+                "type": "invalid_request_error"}})
+        st.settings = new
+        st.pool = st.pool.rebase(new.providers) if st.pool else Pool(new.providers)
         st.router = Router(st.settings, st.pool, st.usage, st.http)
-        return {"ok": True, "providers": len(st.settings.providers)}
+        log.info("reloaded: %d providers, %d keys", len(new.providers), len(st.pool.slots))
+        return {"ok": True, "providers": len(new.providers), "keys": len(st.pool.slots)}
 
     return app

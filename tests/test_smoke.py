@@ -33,6 +33,14 @@ def handler(request: httpx.Request) -> httpx.Response:
     if _key(request).startswith("bad"):
         return httpx.Response(401, json={"error": {"message": "invalid api key"}})
     body = json.loads(request.content)
+    if url.endswith("/v1/embeddings"):
+        inp = body.get("input")
+        k = len(inp) if isinstance(inp, list) else 1
+        return httpx.Response(200, json={
+            "object": "list", "model": body["model"],
+            "data": [{"object": "embedding", "index": i, "embedding": [0.5, 0.5]}
+                     for i in range(k)],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3}})
     return _anthropic(body) if url.endswith("/v1/messages") else _openai(body)
 
 
@@ -65,10 +73,12 @@ def _openai(body):
 def make_settings(tmp_path) -> Settings:
     return Settings(listen="127.0.0.1:8000", master_keys=["sk-test"], strategy="priority",
                     retry=2, cooldown=30, db_path=str(tmp_path / "usage.sqlite3"),
+                    currency="USD", pricing={"demo": {"prompt": 2.0, "completion": 8.0}},
                     providers=[
                         ProviderSpec(name="primary", base_url="http://mock/v1",
                                      keys=["bad-key", "good-key-AAA"],
-                                     models={"demo": "demo-upstream"}, priority=10),
+                                     models={"demo": "demo-upstream"}, priority=10,
+                                     embeddings={"demo-embed": "embed-upstream"}),
                         ProviderSpec(name="backup", base_url="http://mock/v1",
                                      keys=["good-key-BBB"], models={"demo": "demo-bak"}),
                         ProviderSpec(name="claude", base_url="http://mock", style="anthropic",
@@ -105,7 +115,7 @@ def test_auth_required(client):
 
 def test_model_list_exposes_aliases_only(client):
     ids = [m["id"] for m in client.get("/v1/models", headers=H).json()["data"]]
-    assert ids == ["claude-sonnet", "demo", "empty-model"]
+    assert ids == ["claude-sonnet", "demo", "empty-model", "demo-embed"]
     assert "ghost" not in ids and "demo-upstream" not in ids
 
 
@@ -174,3 +184,73 @@ def test_reload_and_env_expansion(tmp_path, monkeypatch):
     assert st.master_keys == ["sk-live-1"]
     assert [p.keys for p in st.providers][0] == ["sk-live-1"]
     assert _env("$MY_KEY") == "sk-live-1"
+
+
+def test_embeddings_route_and_account(client):
+    r = client.post("/v1/embeddings", headers=H,
+                    json={"model": "demo-embed", "input": ["x", "y"]})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["model"] == "demo-embed"
+    assert [d["object"] for d in j["data"]] == ["embedding", "embedding"]
+    assert j["usage"]["total_tokens"] == 3
+    assert any(u.endswith("/v1/embeddings") for u in CALLS), CALLS
+
+
+def test_embeddings_rejects_chat_alias(client):
+    r = client.post("/v1/embeddings", headers=H, json={"model": "demo", "input": "x"})
+    assert r.status_code in (404, 503), r.text
+
+
+def test_stream_events_are_normalized(client):
+    r = client.post("/v1/chat/completions", headers=H,
+                    json={"model": "demo", "stream": True,
+                          "messages": [{"role": "user", "content": "x"}]})
+    assert r.status_code == 200
+    events = [e.split("data: ", 1)[1] for e in r.text.split("\n\n") if "data: " in e]
+    payloads = [json.loads(e) for e in events if e.strip() != "[DONE]"]
+    assert payloads, r.text
+    for p in payloads:
+        assert p["object"] == "chat.completion.chunk", p
+        assert p["model"] == "demo", p
+
+
+def test_usage_endpoint_reports_cost(client):
+    body = {"model": "demo", "messages": [{"role": "user", "content": "x"}]}
+    for _ in range(2):
+        client.post("/v1/chat/completions", headers=H, json=body)
+    u = client.get("/v1/usage", headers=H).json()
+    assert u["currency"] == "USD"
+    assert u["totals"]["calls"] >= 1
+    assert u["totals"]["cost"] > 0, u
+    assert u["daily"] and u["daily"][0]["tokens"] > 0
+    demo = [m for m in u["by_model"] if m["alias"] == "demo"]
+    assert demo and demo[0]["cost"] > 0, u["by_model"]
+
+
+def test_reload_guard_and_key_health(client, tmp_path, monkeypatch):
+    body = {"model": "demo", "messages": [{"role": "user", "content": "x"}]}
+    client.post("/v1/chat/completions", headers=H, json=body)
+    all_before = client.get("/pool").json()["slots"]
+    before = [x for x in all_before if x["provider"] == "primary"]
+    assert any(x["fails"] for x in before), before
+
+    # 1. no config file on disk -> reload refused, live state untouched
+    assert client.post("/admin/reload", headers=H).status_code == 409
+    mid = [x for x in client.get("/pool").json()["slots"] if x["provider"] == "primary"]
+    assert [x["fails"] for x in mid] == [x["fails"] for x in before], mid
+
+    # 2. valid config -> applied, but observed key health survives the swap
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        "master_keys:\n  - sk-test\nproviders:\n"
+        "  - name: primary\n    base_url: http://mock/v1\n"
+        "    keys:\n      - bad-key\n      - good-key-AAA\n"
+        "    models:\n      demo: demo-upstream\n", encoding="utf-8")
+    monkeypatch.setenv("LLMROUTER_CONFIG", str(cfg))
+    r = client.post("/admin/reload", headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["providers"] == 1
+    after = client.get("/pool").json()["slots"]
+    assert [x["fails"] for x in after] == [x["fails"] for x in before], (before, after)
+    assert any(x["cooldown_left"] > 0 for x in after), after

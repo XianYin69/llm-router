@@ -55,7 +55,42 @@ class Router:
                        prompt=int(u.get("prompt_tokens", 0) or 0),
                        completion=int(u.get("completion_tokens", 0) or 0),
                        total=int(u.get("total_tokens", 0) or 0),
-                       stream=stream, error=error[:300])
+                       stream=stream, error=error[:300],
+                       cost=self.s.cost_of(alias, int(u.get("prompt_tokens", 0) or 0),
+                                           int(u.get("completion_tokens", 0) or 0)))
+
+    async def embeddings(self, payload: dict) -> dict:
+        # OpenAI-compatible /v1/embeddings, same pool + failover rules as chat.
+        alias = str(payload.get("model") or "")
+        cands = self.pool.candidates(alias, self.s.strategy, embed=True)
+        if not cands:
+            raise NoUpstream(f"no embedding upstream for model '{alias}'")
+        last: UpstreamError | None = None
+        for slot in cands[: max(1, self.s.retry + 1)]:
+            t0 = time.time()
+            up_model = self.pool.upstream_model(slot, alias, embed=True)
+            req = self.http.build_request("POST", up.embed_url(slot.provider),
+                                          headers=up.headers(slot.provider, slot.key),
+                                          json=dict(payload, model=up_model),
+                                          timeout=slot.provider.timeout)
+            try:
+                r = await self.http.send(req)
+            except httpx.RequestError as e:
+                slot.note_fail(self.s.cooldown)
+                last = UpstreamError(502, f"{slot.label}: {e}", slot)
+                continue
+            if r.status_code >= 400:
+                slot.note_fail(self.s.cooldown)
+                detail = _safe_detail(r)
+                last = UpstreamError(r.status_code, detail, slot)
+                self._account(slot, alias, r.status_code, t0, None, 0, str(detail))
+                continue
+            data = r.json()
+            slot.note_ok()
+            data["model"] = alias
+            self._account(slot, alias, 200, t0, data.get("usage"), 0, upstream=up_model)
+            return data
+        raise last or UpstreamError(502, "all embedding upstreams failed")
 
     async def complete(self, payload: dict) -> dict:
         alias = str(payload.get("model") or "")
@@ -121,15 +156,48 @@ class Router:
                     yield up.sse(c)
                 yield b"data: [DONE]\n\n"
             else:
+                buf = b""
                 async for raw in r.aiter_raw():
-                    yield raw
-                    usage = _sniff_usage(raw, usage)
+                    buf += raw
+                    while b"\n\n" in buf:
+                        evt, buf = buf.split(b"\n\n", 1)
+                        out, u = _normalize_event(evt, alias)
+                        usage = u or usage
+                        yield out
+                if buf.strip():
+                    out, u = _normalize_event(buf, alias)
+                    usage = u or usage
+                    yield out
         finally:
             await r.aclose()
             slot.note_ok()
             self._account(slot, alias, 200, t0, usage, 1,
                           upstream=self.pool.upstream_model(slot, alias))
 
+
+def _normalize_event(evt: bytes, alias: str) -> tuple:
+    """Rewrite one SSE event: guarantee object + public model, sniff usage."""
+    out, usage = [], {}
+    for line in evt.split(b"\n"):
+        s = line.strip()
+        if not s.startswith(b"data:"):
+            out.append(line)
+            continue
+        payload = s[5:].strip()
+        if payload in (b"", b"[DONE]"):
+            out.append(line)
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            out.append(line)
+            continue
+        obj.setdefault("object", "chat.completion.chunk")
+        obj["model"] = alias
+        if obj.get("usage"):
+            usage = obj["usage"]
+        out.append(b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    return b"\n".join(out) + b"\n\n", usage
 
 def _sniff_usage(chunk: bytes, cur: dict) -> dict:
     for line in chunk.split(b"\n"):

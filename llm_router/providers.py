@@ -58,15 +58,24 @@ class Pool:
             KeySlot(p, k) for p in providers for k in p.keys]
         self._cursor = 0
 
-    def upstream_model(self, slot: KeySlot, alias: str) -> str:
-        return slot.provider.models.get(alias, alias)
+    def upstream_model(self, slot: KeySlot, alias: str, embed: bool = False) -> str:
+        table = slot.provider.embeddings if embed else slot.provider.models
+        return table.get(alias, alias)
 
-    def serving(self, alias: str) -> list[KeySlot]:
-        return [s for s in self.slots if s.provider.enabled and alias in s.provider.aliases()]
+    def serving(self, alias: str, embed: bool = False) -> list[KeySlot]:
+        out = []
+        for s in self.slots:
+            if not s.provider.enabled:
+                continue
+            names = s.provider.embeddings if embed else s.provider.aliases()
+            if alias in names:
+                out.append(s)
+        return out
 
-    def candidates(self, alias: str, strategy: str = "priority") -> list[KeySlot]:
+    def candidates(self, alias: str, strategy: str = "priority",
+                   embed: bool = False) -> list[KeySlot]:
         now = time.time()
-        live = [s for s in self.serving(alias) if s.available(now)]
+        live = [s for s in self.serving(alias, embed) if s.available(now)]
         if not live:
             return []
         if strategy == "round_robin":
@@ -84,6 +93,16 @@ class Pool:
         # priority: high priority first, then low failure count, then weight
         return sorted(live, key=lambda s: (-s.provider.priority, s.fails, -s.provider.weight))
 
+    def rebase(self, providers) -> "Pool":
+        # Rebuild slots for a new provider set but carry over observed health,
+        # so /admin/reload cannot instantly un-cool a key that is failing.
+        keep = {(x.provider.name, x.key): x for x in self.slots}
+        fresh = Pool(providers)
+        for x in fresh.slots:
+            old = keep.get((x.provider.name, x.key))
+            if old:
+                x.fails, x.dead_until, x.ok = old.fails, old.dead_until, old.ok
+        return fresh
     def stats(self) -> list[dict]:
         return [{"provider": s.provider.name, "key": mask(s.key), "ok": s.ok,
                  "fails": s.fails,

@@ -27,13 +27,17 @@ async function refresh(){const m=document.getElementById('msg');m.textContent=''
  try{const [s,p,mods]=await Promise.all([j('/stats'),j('/pool'),j('/v1/models')]);
   document.getElementById('calls').textContent=s.calls;
   document.getElementById('tokens').textContent=s.tokens;
+  document.getElementById('cost').textContent=(+s.cost||0).toFixed(4)+' '+(s.currency||'');
   document.getElementById('slots').textContent=p.slots.length;
   document.getElementById('models').textContent=mods.data.length;
-  tbl('bymodel',s.by_model,['alias','calls','tokens']);
-  tbl('byprov',s.by_provider,['provider','calls','tokens','avg_ms','errors']);
+  tbl('bymodel',s.by_model,['alias','calls','tokens','cost']);
+  tbl('byprov',s.by_provider,['provider','calls','tokens','cost','avg_ms','errors']);
   tbl('pool',p.slots,['provider','key','ok','fails','cooldown_left']);
   tbl('recent',s.recent.map(r=>({...r,ts:new Date(r.ts*1000).toLocaleTimeString()})),
-      ['ts','alias','provider','status','ms','total','stream']);
+      ['ts','alias','provider','status','ms','total','cost','stream']);
+  try{const u=await j('/v1/usage?days=14');
+    tbl('daily',u.daily,['d','calls','tokens','cost','errors']);
+  }catch(e){tbl('daily',[],['d','calls','tokens','cost','errors']);}
   document.getElementById('strategy').textContent=p.strategy;
  }catch(e){m.textContent=e.message}}
 refresh();
@@ -47,11 +51,13 @@ BODY = """
 <main><div class="cards">
 <div class="card"><b id="calls">-</b>calls</div>
 <div class="card"><b id="tokens">-</b>tokens</div>
+<div class="card"><b id="cost">-</b>cost</div>
 <div class="card"><b id="slots">-</b>key slots</div>
 <div class="card"><b id="models">-</b>models</div></div>
 <h2>By model</h2><table id="bymodel"></table>
 <h2>By provider</h2><table id="byprov"></table>
 <h2>Key pool</h2><table id="pool"></table>
+<h2>Last 14 days</h2><table id="daily"></table>
 <h2>Recent calls</h2><table id="recent"></table>
 <h2>Client config</h2><pre id="hint"></pre></main>
 <script>document.getElementById('hint').textContent =

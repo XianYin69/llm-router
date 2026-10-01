@@ -16,7 +16,7 @@ llm-router ── key pool      (rotation, 401/429 cooldown, per-key max_rpm)
 provider A / provider B / provider C ...
 ```
 
-## Features (v0.1)
+## Features (v0.2)
 
 - **OpenAI-compatible API**: `POST /v1/chat/completions` (JSON + SSE streaming), `GET /v1/models`
 - **Multi-key pools**: a failing key (`401/403/408/429/5xx/529`) is parked for `cooldown`
@@ -28,7 +28,16 @@ provider A / provider B / provider C ...
   including SSE translation and token accounting
 - **Per-key `max_rpm`** limiting and `${ENV_VAR}` secret expansion (no keys in the file)
 - **Observability**: `/stats` (per provider / per model / recent calls), `/pool` (live key
-  health), dashboard at `/`, `POST /admin/reload` to re-read config without restart
+  health), `/v1/usage?days=14` (daily totals + estimated cost), dashboard at `/`
+- **Estimated cost per call**: a `pricing:` table (per 1M tokens, `'*'` = default row) is
+  applied to every logged call, so `/v1/usage` and the dashboard show spend per model,
+  provider and day
+- **Embeddings**: declare `embeddings:` on any OpenAI-compatible provider and the alias is
+  published in `/v1/models` and served by `POST /v1/embeddings` with the same failover rules
+- **Spec-faithful streaming**: every SSE chunk is rewritten to carry
+  `object: "chat.completion.chunk"` plus the public alias, so strict OpenAI SDK clients work
+- **Safe `POST /admin/reload`**: a missing or provider-less config is refused (409) instead of
+  wiping live routing, and key health (fails / cooldown) carries over across the reload
 
 ## Quick start
 

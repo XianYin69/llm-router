@@ -18,6 +18,9 @@ def chat_url(p: ProviderSpec) -> str:
     return base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
 
 
+def embed_url(p: ProviderSpec) -> str:
+    base = p.base_url.rstrip("/")
+    return base + "/embeddings" if base.endswith("/v1") else base + "/v1/embeddings"
 def headers(p: ProviderSpec, key: str) -> dict:
     if p.style == "anthropic":
         h = {"content-type": "application/json", "x-api-key": key,

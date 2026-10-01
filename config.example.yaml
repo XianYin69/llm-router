@@ -7,7 +7,12 @@ master_keys:                    # client-facing keys ("sk-router-..."); empty = 
 strategy: priority              # priority | round_robin | weighted
 retry: 2                        # extra attempts after the first failure
 cooldown: 60                    # seconds a failing key is skipped
-db_path: usage.sqlite3          # call log for /stats + dashboard
+db_path: usage.sqlite3          # call log for /stats + /v1/usage + dashboard
+currency: USD                   # label only; pricing numbers are in this currency
+pricing:                        # per 1M tokens, used to estimate cost per call
+  '*': {prompt: 0.15, completion: 0.60}     # fallback row for unlisted aliases
+  gpt-4o-mini: {prompt: 0.15, completion: 0.60}
+  claude-3-5-sonnet: {prompt: 3.00, completion: 15.00}
 log_level: INFO
 
 providers:
@@ -23,6 +28,8 @@ providers:
     weight: 3                    # used by strategy=weighted
     timeout: 120
     max_rpm: 0                   # 0 = unlimited; per-slot requests/minute cap
+    embeddings:                  # optional: serve POST /v1/embeddings from this provider
+      my-embeddings: text-embedding-3-small
 
   - name: openai-compatible      # any OpenAI-shaped endpoint (DeepSeek, Moonshot, vLLM...)
     base_url: https://api.deepseek.com/v1
