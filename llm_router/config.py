@@ -106,7 +106,7 @@ def load_config(path: str | os.PathLike | None = None) -> Settings:
             max_rpm=int(item.get("max_rpm", 0)), enabled=bool(item.get("enabled", True)),
             extra_headers=dict(_env(item.get("extra_headers") or {})),
             embeddings=dict(_env(item.get("embeddings") or {}))))
-    return Settings(
+    settings = Settings(
         listen=raw.get("listen", Settings.listen),
         master_keys=[k for k in _env(raw.get("master_keys") or []) if k],
         strategy=raw.get("strategy", Settings.strategy),
@@ -117,3 +117,6 @@ def load_config(path: str | os.PathLike | None = None) -> Settings:
         currency=raw.get("currency", Settings.currency),
         pricing={k: dict(v or {}) for k, v in (raw.get("pricing") or {}).items()},
         providers=provs)
+    from .keys import ensure_master_key
+    settings.key_source = ensure_master_key(settings, path)
+    return settings

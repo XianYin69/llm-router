@@ -10,3 +10,4 @@ usage.sqlite3
 Dockerfile.local
 .idea/
 .vscode/
+router.key

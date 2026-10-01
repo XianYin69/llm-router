@@ -47,6 +47,13 @@ copy config.example.yaml config.yaml      # Windows (cp on *nix), then edit prov
 set OPENAI_API_KEY=***                    # ${...} is expanded from the environment
 python run.py                             # http://127.0.0.1:8000  (dashboard at /)
 ```
+On startup the console prints a banner: web dashboard URL, `.../v1` base URL, the
+client key in effect, and provider/key/model counts. If `master_keys` is empty the
+gateway mints a random `sk-router-<32 bytes>` key and stores it in `router.key`
+next to the config, so restarts and `--reload` keep the same key (it is gitignored).
+Resolution order: config `master_keys` > `LLMROUTER_MASTER_KEY` > `router.key`
+(generated on first run). Flags: `--no-key` runs unauthenticated, `--rotate-key`
+mints a fresh key and overwrites the file.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
