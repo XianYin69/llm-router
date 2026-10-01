@@ -1,0 +1,36 @@
+# llm-router configuration (copy to config.yaml, then `python run.py`)
+# Keys support ${ENV_VAR} or ${ENV_VAR:default} expansion.
+
+master_keys:
+  - ${LLMROUTER_KEY:sk-local-dev}   # clients must send: Authorization: Bearer <key>
+anon_allowed: false                  # true = no auth required (local experiments)
+max_retries: 3
+cooldown: 30                         # seconds a failing key is parked
+
+providers:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_keys:                        # key pool: round-robin + auto cooldown
+      - ${OPENROUTER_API_KEY_1}
+      - ${OPENROUTER_API_KEY_2}
+    weight: 2
+    models:
+      - openai/gpt-4o-mini
+      - anthropic/claude-3.5-sonnet
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_keys: [${DEEPSEEK_API_KEY}]
+    models: [deepseek-chat, deepseek-reasoner]
+  ollama:
+    base_url: http://127.0.0.1:11434/v1
+    api_keys: [ollama]               # local model, free tier traffic
+    models: [qwen2.5:7b-instruct]
+
+# public name -> ordered fallback chain (provider/model)
+routes:
+  gpt-4o-mini:
+    - openrouter/openai/gpt-4o-mini
+    - deepseek/deepseek-chat
+  chat:
+    - deepseek/deepseek-chat
+    - ollama/qwen2.5:7b-instruct
