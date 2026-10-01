@@ -236,6 +236,9 @@ def test_reload_guard_and_key_health(client, tmp_path, monkeypatch):
     assert any(x["fails"] for x in before), before
 
     # 1. no config file on disk -> reload refused, live state untouched
+    #    pin the path explicitly: a real config.yaml in the repo cwd must not
+    #    make this assertion depend on where pytest was launched from
+    monkeypatch.setenv("LLMROUTER_CONFIG", str(tmp_path / "absent.yaml"))
     assert client.post("/admin/reload", headers=H).status_code == 409
     mid = [x for x in client.get("/pool").json()["slots"] if x["provider"] == "primary"]
     assert [x["fails"] for x in mid] == [x["fails"] for x in before], mid
