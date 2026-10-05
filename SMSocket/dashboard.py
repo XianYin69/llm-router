@@ -191,6 +191,11 @@ _NET = """
  background:transparent;border:0;color:var(--fg);cursor:pointer;padding:3px 6px}
 .netglyph:hover{opacity:.95}
 .netglyph.off{display:none}
+.hide{display:none}
+.reach td{padding:2px 6px;font-size:12px}
+.v-healthy{background:rgba(46,160,67,.22)}.v-slow{background:rgba(212,160,23,.22)}
+.v-blocked{background:rgba(226,68,68,.26)}.v-unstable{background:rgba(120,140,255,.22)}
+.v-unknown{opacity:.5}
 .netmask{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:41;display:none}
 .netmask.on{display:block}
 .netpanel{position:fixed;top:0;right:0;bottom:0;width:min(430px,94vw);z-index:42;
@@ -234,7 +239,7 @@ function go(p){if(PAGES.indexOf(p)<0)p='overview';
  try{localStorage.setItem(PKEY,p)}catch(e){}
  if(location.hash!=='#'+p)try{history.replaceState(null,'','#'+p)}catch(e){}
  if(p==='providers')loadConfig();
- if(p==='socket'){loadSocket();tickSocket()}
+ if(p==='socket'){loadSocket();renderStack({});loadReach();tickSocket()}
  if(p==='discover'){loadProvidersForProbe();loadCatalog()}
 
  if(p==='settings'){loadSelf();loadSettings()}}
@@ -398,12 +403,49 @@ async function loadSocket(){try{const x=await j('/concurrency');
  document.getElementById('s_ppc').textContent=x.per_provider_concurrency||'不限';
  document.getElementById('s_qw').textContent=(x.queue_wait||0)+'s';
  document.getElementById('s_sat').textContent=x.saturated?'已饱和（新请求排队/429）':'有余量';
+ renderStack(x);
  const rows=x.by_provider||{},keys=Object.keys(rows),bp=document.getElementById('sprov');
  bp.innerHTML=keys.length?('<tr><th>提供方</th><th>在途</th><th>峰值</th><th>累计</th><th>失败</th></tr>'+
   keys.map(k=>'<tr><td><b>'+esc(k)+'</b></td><td>'+rows[k].active+'</td><td>'+rows[k].peak+
    '</td><td>'+rows[k].total+'</td><td>'+rows[k].errors+'</td></tr>').join(''))
   :'<tr><td class=empty colspan=5>暂无在途数据</td></tr>';
  }catch(e){toast('并发数据加载失败 · '+e.message)}}
+const ASSESS_ON=__ASSESS_ON__;
+function renderStack(x){const st=(x&&x.stack)||null,blk=document.getElementById('stackblk');
+ if(!blk)return; if(!st||!st.enabled){blk.classList.add('hide');return}
+ blk.classList.remove('hide');
+ const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v};
+ set('k_policy',st.policy);set('k_depth',st.depth);set('k_peak',st.peak);
+ set('k_popped',st.popped);set('k_expired',st.expired);
+ set('k_avg',num(st.avg_parked_ms,0));set('k_pmax',num(st.parked_ms_peak,0));
+ const es=st.entries||[],t=document.getElementById('kentries');
+ t.innerHTML=es.length?('<tr><th>别名</th><th>提供方</th><th>原因</th><th>已等待ms</th></tr>'+
+  es.map(e=>'<tr><td><b>'+esc(e.alias||'-')+'</b></td><td>'+esc(e.provider||'-')+
+   '</td><td>'+esc(e.reason)+'</td><td>'+e.waited_ms+'</td></tr>').join(''))
+  :'<tr><td class=empty colspan=4>栈内没有等待中的请求</td></tr>'}
+async function loadReach(){const blk=document.getElementById('reachblk');
+ if(!blk||!ASSESS_ON){return}
+ try{const d=await j('/assess'),rows=d.rows||[];
+  blk.classList.remove('hide');
+  document.getElementById('r_window').textContent=Math.round((d.window_s||0)/60)+' 分钟';
+  document.getElementById('r_rows').textContent=(d.counts||{}).rows||0;
+  const eg=[...new Set(rows.map(r=>r.egress))].sort();
+  const cell=(m,e)=>rows.filter(r=>r.model===m&&r.egress===e)[0];
+  const t=document.getElementById('reach');
+  t.innerHTML=rows.length?('<tr><th>模型</th>'+eg.map(e=>'<th>'+esc(e)+'</th>').join('')+
+   '</tr>'+[...new Set(rows.map(r=>r.model))].sort().map(m=>'<tr><td><b>'+esc(m)+'</b>'+
+   eg.map(e=>{const c=cell(m,e);if(!c)return '<td class=v-unknown>-</td>';
+    return '<td class=v-'+c.verdict+' title="p50 '+c.p50_ms+'ms · 成功率 '+
+     Math.round(c.ok_ratio*100)+'% · '+(c.last_error||'ok')+'">'+
+     c.p50_ms+'ms</td>'}).join('')+'</tr>').join(''))
+   :'<tr><td class=empty colspan=6>暂无评估数据（等待定时探测或点“立即探测”）</td></tr>';
+  try{const st=await j('/assess/status');
+   const nx=st.next_run?new Date(st.next_run*1000).toLocaleTimeString():'未排程';
+   document.getElementById('r_next').textContent=nx}catch(e){}}
+ catch(e){blk.classList.add('hide')}}
+async function runReach(){try{toast('探测中…');const d=await send('/assess/run','POST',
+ {async:true});toast(d.accepted?'已排入探测':'探测未启动：'+(d.reason||''))}
+ catch(e){toast('探测失败 · '+e.message)}}
 function tickSocket(){if(!AUTO)return;loadSocket();TMR=setTimeout(tickSocket,1000)}
 function toggleAuto(){AUTO=!AUTO;document.getElementById('s_auto').textContent='自动刷新：'+(AUTO?'开':'关');
  clearTimeout(TMR);if(AUTO)tickSocket()}
@@ -728,6 +770,21 @@ BODY += """
 <button onclick="loadSocket()">刷新</button>
 <button id="s_auto" onclick="toggleAuto()">自动刷新：关</button></div>
 <h2>按提供方并发</h2><table id="sprov"></table>
+<div id="stackblk" class="hide">
+<h2>压栈调度</h2>
+<div class="cred"><em>策略</em><code id="k_policy">-</code><em>深度</em><code id="k_depth">-</code>
+<em>峰值</em><code id="k_peak">-</code><em>唤醒</em><code id="k_popped">-</code>
+<em>超时</em><code id="k_expired">-</code><em>平均滞留</em><code id="k_avg">-</code>
+<em>最长滞留</em><code id="k_pmax">-</code></div>
+<table id="kentries"></table></div>
+<div id="reachblk" class="hide">
+<h2>模型通达性</h2>
+<div class="cred"><em>窗口</em><code id="r_window">-</code><em>下次探测</em><code id="r_next">-</code>
+<em>样本</em><code id="r_rows">-</code>
+<button onclick="loadReach()">刷新</button>
+<button onclick="runReach()">立即探测</button></div>
+<table id="reach" class="reach"></table>
+<div class="muted">绿=健康 · 黄=慢 · 红=不通 · 蓝=抖动；行=模型，列=出口路径</div></div>
 <h2>并行批量发送</h2>
 <form id="bf2" onsubmit="runBatch();return false">
 <label>并发数<input id="q_conc" type="number" value="8"></label>

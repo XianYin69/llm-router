@@ -150,6 +150,172 @@ def clash_from_raw(raw, default: ClashConfig | None = None) -> ClashConfig:
     return out
 
 
+
+PARK_REASONS = ("saturated", "rpm", "provider_saturated")
+STACK_POLICIES = ("lifo", "fifo", "priority")
+
+
+@dataclass
+class StackConfig:
+    """`stack:` block - park requests when a limit bites (see stacksched.py).
+
+    Off by default: with `enabled: false` the gate behaves exactly as before
+    (saturated caller -> immediate 429). `wait` is how long one caller accepts
+    being parked, `park_on` picks which limits may park it at all.
+    """
+
+    enabled: bool = False
+    max_depth: int = 1000                  # parked callers at once, then 429
+    wait: float = 120.0                    # seconds a caller tolerates parking
+    policy: str = "lifo"                   # lifo | fifo | priority
+    park_on: list[str] = field(
+        default_factory=lambda: ["saturated", "rpm", "provider_saturated"])
+    interval: float = 0.25                 # drain poll (seconds)
+    repark: int = 3                        # batch retries after a 429
+
+    def parks_on(self, reason: str) -> bool:
+        return self.enabled and reason in self.park_on
+
+    def as_config(self) -> dict:
+        return {"enabled": self.enabled, "max_depth": self.max_depth,
+                "wait": self.wait, "policy": self.policy,
+                "park_on": list(self.park_on), "interval": self.interval,
+                "repark": self.repark}
+
+
+def stack_from_raw(raw, default: StackConfig | None = None) -> StackConfig:
+    """Parse + validate the `stack:` block; a missing block keeps the default."""
+    base = default or StackConfig()
+    if not isinstance(raw, dict):
+        return base
+    policy = str(raw.get("policy", base.policy) or "lifo").strip().lower()
+    if policy not in STACK_POLICIES:
+        raise ValueError(f"stack.policy must be one of {STACK_POLICIES}")
+    reasons = raw.get("park_on", base.park_on) or []
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    reasons = [str(r).strip().lower() for r in _env(list(reasons)) if str(r).strip()]
+    bad = [r for r in reasons if r not in PARK_REASONS]
+    if bad:
+        raise ValueError(f"stack.park_on must be a subset of {PARK_REASONS} (got {bad})")
+    out = StackConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        max_depth=int(raw.get("max_depth", base.max_depth) or base.max_depth),
+        wait=float(raw.get("wait", base.wait) or base.wait),
+        policy=policy,
+        park_on=reasons or list(PARK_REASONS),
+        interval=float(raw.get("interval", base.interval) or base.interval),
+        repark=int(raw.get("repark", base.repark) or 0))
+    if out.max_depth < 1:
+        raise ValueError("stack.max_depth must be >= 1")
+    if out.wait <= 0:
+        raise ValueError("stack.wait must be > 0 seconds")
+    if out.interval < 0.01:
+        raise ValueError("stack.interval must be >= 0.01 second")
+    if out.repark < 0:
+        raise ValueError("stack.reparks must be 0 or more")
+    return out
+
+
+ASSESS_EGRESS = ("auto", "direct")
+ASSESS_VERDICTS = ("healthy", "slow", "blocked", "unstable", "unknown")
+
+
+@dataclass
+class AssessConfig:
+    """`assess:` block - how we measure model performance and reachability.
+
+    Two sources feed one table (see assess.py): `live` rows harvested from real
+    traffic (free, no extra calls) and `probe` rows from a scheduled sweep that
+    actually calls the model. `egress: auto` sweeps direct plus every clash
+    path, which is what makes "is this model reachable from this network
+    environment?" a question we can answer from data instead of folklore.
+    """
+
+    enabled: bool = False
+    interval_s: int = 3600                 # hours between sweeps
+    at: str = ""                           # "HH:MM" daily slot ("" = interval only)
+    models: list[str] = field(default_factory=list)      # [] = every alias
+    providers: list[str] = field(default_factory=list)   # [] = every provider
+    egress: str = "auto"                   # auto | direct | <egress id>
+    prompt: str = "Reply with exactly one word: ok"
+    max_tokens: int = 8
+    concurrency: int = 4
+    timeout: float = 20.0
+    live: bool = True                      # harvest from real traffic
+    live_sample: float = 1.0               # 0..1 share of live calls recorded
+    slow_ms: float = 8000.0                # p50 above this = "slow"
+    window_s: int = 86400                  # report window
+
+    def as_dict(self) -> dict:
+        return {"interval_s": self.interval_s, "max_tokens": self.max_tokens,
+                "concurrency": self.concurrency, "timeout": self.timeout,
+                "live_sample": self.live_sample, "slow_ms": self.slow_ms,
+                "window_s": self.window_s}
+
+    def as_config(self) -> dict:
+        return {"enabled": self.enabled, "interval_s": self.interval_s,
+                "at": self.at, "models": list(self.models),
+                "providers": list(self.providers), "egress": self.egress,
+                "max_tokens": self.max_tokens, "concurrency": self.concurrency,
+                "timeout": self.timeout, "live": self.live,
+                "live_sample": self.live_sample, "slow_ms": self.slow_ms,
+                "window_s": self.window_s}
+
+
+def assess_from_raw(raw, default: AssessConfig | None = None) -> AssessConfig:
+    """Parse + validate the `assess:` block; a missing block keeps the default."""
+    base = default or AssessConfig()
+    if not isinstance(raw, dict):
+        return base
+    at = str(raw.get("at", base.at) or "").strip()
+    if at:
+        parts = at.split(":")
+        if len(parts) != 2 or not all(p.strip().isdigit() for p in parts) \
+                or not (0 <= int(parts[0]) < 24 and 0 <= int(parts[1]) < 60):
+            raise ValueError("assess.at must be HH:MM (24h) or empty")
+        at = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    models = raw.get("models", base.models) or []
+    if isinstance(models, str):
+        models = [models]
+    provs = raw.get("providers", base.providers) or []
+    if isinstance(provs, str):
+        provs = [provs]
+    def num(key, cast):
+        """Read one number as configured: absent/null = default, 0 = 0."""
+        v = raw.get(key, None)
+        return base.as_dict()[key] if v is None else cast(v)
+
+    out = AssessConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        interval_s=int(num("interval_s", int)),
+        at=at,
+        models=[str(m).strip() for m in _env(list(models)) if str(m).strip()],
+        providers=[str(p).strip() for p in _env(list(provs)) if str(p).strip()],
+        egress=str(raw.get("egress", None) or base.egress).strip(),
+        prompt=str(raw.get("prompt", None) or base.prompt),
+        max_tokens=int(num("max_tokens", int)),
+        concurrency=int(num("concurrency", int)),
+        timeout=float(num("timeout", float)),
+        live=bool(raw.get("live", base.live)),
+        live_sample=float(num("live_sample", float)),
+        slow_ms=float(num("slow_ms", float)),
+        window_s=int(num("window_s", int)))
+    if out.interval_s < 1:
+        raise ValueError("assess.interval_s must be >= 1 second")
+    if out.concurrency < 1 or out.concurrency > 64:
+        raise ValueError("assess.concurrency must be 1..64")
+    if out.timeout <= 0:
+        raise ValueError("assess.timeout must be > 0 seconds")
+    if out.max_tokens < 1:
+        raise ValueError("assess.max_tokens must be >= 1")
+    if not 0.0 <= out.live_sample <= 1.0:
+        raise ValueError("assess.live_sample must be 0..1")
+    if out.window_s < 1:
+        raise ValueError("assess.window_s must be >= 1 second")
+    return out
+
+
 @dataclass
 class Settings:
     listen: str = "127.0.0.1:8000"
@@ -165,6 +331,8 @@ class Settings:
     currency: str = "USD"          # display currency (mirrors billing.currency)
     billing: Billing = field(default_factory=Billing)
     clash: ClashConfig = field(default_factory=ClashConfig)
+    stack: StackConfig = field(default_factory=StackConfig)
+    assess: AssessConfig = field(default_factory=AssessConfig)
     pricing: dict[str, dict] = field(default_factory=dict)   # alias -> {prompt, completion} per 1M tokens
     providers: list[ProviderSpec] = field(default_factory=list)
 
@@ -240,6 +408,8 @@ def load_config(path: str | os.PathLike | None = None) -> Settings:
         currency=raw.get("currency", Settings.currency),
         billing=billing_from_raw(raw.get("billing"), raw.get("currency", "USD")),
         clash=clash_from_raw(raw.get("clash")),
+        stack=stack_from_raw(raw.get("stack")),
+        assess=assess_from_raw(raw.get("assess")),
         pricing={k: dict(v or {}) for k, v in (raw.get("pricing") or {}).items()},
         providers=provs)
     from .keys import ensure_master_key

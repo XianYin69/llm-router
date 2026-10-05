@@ -68,6 +68,47 @@ provider A / provider B / provider C ...
   `max_concurrency` / `queue_wait` / `per_provider_concurrency` cap simultaneous upstream
   calls, and overflow gets a clean `429` + `Retry-After` instead of a pile-up
 
+## Features (v0.4)
+- **Clash net plane**: score every egress path (direct vs. each proxy/node) per provider and
+  send each call through the best one — a provider only reachable through a proxy outranks a
+  dead direct route. `clash.enabled: false` by default; nothing changes until you turn it on.
+- **Stack scheduler**: instead of refusing the moment a limit bites, park the caller on a
+  LIFO/FIFO/priority stack and wake it when capacity frees up. `stack.enabled: false` keeps
+  today's behaviour (saturated → immediate 429). Parked callers still get a 429 after
+  `stack.wait`, now carrying how long they waited.
+- **Model + reachability assessment**: `assess` mirrors the traffic you already serve
+  (`live`, free) *and* runs scheduled sweeps that really call each model over each egress
+  path (`probe`), producing per-cell verdicts — healthy / slow / blocked / unstable — so
+  "is this model usable from this network?" is answered from measurements, not folklore.
+- **Dashboard**: the socket page gains stack counters and a reachability heat table
+  (model × egress); both blocks stay out of the DOM entirely while disabled.
+
+### 内部网络接口 / internal net plane
+`/internal/net/*` is the operator surface for the clash plane (`state`, `proxies`, `probes`,
+`scores`, `select`, `mode`, `flush`). It is mounted with `include_in_schema=False`: it appears
+in neither `/openapi.json` nor `/docs`, and the dashboard exposes it only as a muted footer
+glyph that is absent from the DOM when `clash.enabled` is false. It is authenticated by the
+same master key as everything else — the discretion is about not advertising the surface,
+not about replacing auth.
+
+```bash
+curl -H "Authorization: Bearer $KEY" localhost:8000/internal/net/state
+curl -X POST -H "Authorization: Bearer $KEY" localhost:8000/internal/net/probes   # re-measure
+curl -X PUT  -H "Authorization: Bearer $KEY" -d '{"group":"PROXY-GRP","node":"hk-1"}' \
+     localhost:8000/internal/net/select
+```
+
+### Assessment + scheduling examples
+```bash
+# verdicts for the last 24h, per model x egress path
+curl -H "Authorization: Bearer $KEY" localhost:8000/assess
+
+# sweep now (async, then poll) / change the schedule live
+curl -X POST -H "Authorization: Bearer $KEY" -d '{"async":true}' localhost:8000/assess/run
+curl -X PUT  -H "Authorization: Bearer $KEY" -d '{"interval_s":900,"at":"03:30"}' \
+     localhost:8000/assess/schedule
+```
+
 ## Launch entry points (kernel start / stop / status)
 
 The gateway core is started through per-shell entry points in the repo root. Every one of

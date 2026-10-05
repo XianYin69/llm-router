@@ -14,12 +14,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .batch import BatchRunner, BatchTooLarge
 from .clash import ClashController, EgressRegistry, NetPlane
 from .net_routes import build as build_net
+from .assess import Assessor
+from .assess_routes import build as build_assess
 from .concurrency import Gate, Meter, SMSocketBusy
 from .config import Settings, envv, load_config
 from .discover import Catalog
 from .admin import build as build_admin
 from .dashboard import PAGE
 from .providers import Pool
+from .stacksched import StackScheduler
 from .router import NoUpstream, Router, UpstreamError
 from .usage import Usage
 
@@ -44,6 +47,56 @@ class State:
         self.clash: ClashController | None = None
         self.egress: EgressRegistry | None = None
         self.net: NetPlane | None = None
+        # model/net assessment - None while `assess.enabled` is false
+        self.assessor: Assessor | None = None
+        # stack scheduler - None while `stack.enabled` is false (plain 429s).
+        # The `gate` setter above already built and attached it; a bare
+        # annotation keeps the type visible without clobbering that attachment.
+        self.stack: StackScheduler | None
+
+    def build_stack(self) -> None:
+        """(Re)create the parking lot and hand it to the gate.
+
+        The gate owns the admission decision, so the stack is attached to it
+        rather than consulted per request; with the block disabled the gate
+        keeps `stack = None` and behaves exactly like pre-v0.4b.
+
+        Runs on every gate swap (lifespan, /admin/reload, admin.apply_state):
+        the previous drain task is cancelled and its parked callers released,
+        otherwise each reload would leak one background task and leave callers
+        waiting on a scheduler that nothing wakes any more.
+        """
+        old = getattr(self, "stack", None)
+        self.stack = None
+        if old is not None:
+            for entry in list(old.stack.items):
+                old.stack.expire(entry)      # parked callers get their 429 now
+            if old._task is not None:
+                old._task.cancel()           # no public sync stop on the scheduler
+        cfg = self.settings.stack
+        if not cfg.enabled:
+            self.gate.attach_stack(None)
+            return
+        self.stack = StackScheduler(cfg, self.gate, self.pool)
+        self.gate.attach_stack(self.stack)
+        try:
+            asyncio.get_running_loop()       # start only where a loop is live
+        except RuntimeError:                 # create_app outside a loop: lifespan
+            pass
+        else:
+            self.stack.start()
+
+    @property
+    def gate(self) -> Gate:
+        return self._gate
+
+    @gate.setter
+    def gate(self, value: Gate) -> None:
+        # a gate replacement must re-attach the stack: a fresh Gate holding the
+        # old scheduler (or none) silently loses the limiter on hot reload
+        self._gate = value
+        if getattr(self, "settings", None) is not None:
+            self.build_stack()
 
     def build_net_plane(self) -> None:
         """(Re)create controller / egress registry / scoring plane from config.
@@ -63,7 +116,17 @@ class State:
     def attach_router(self) -> Router:
         self.router = Router(self.settings, self.pool, self.usage, self.http,
                              self.gate, net=self.net, egress=self.egress)
+        self.router.assessor = self.assessor      # mirrors live calls if enabled
         return self.router
+
+    def build_assessor(self) -> None:
+        """(Re)create the assessor from config. Disabled = no object at all,
+        so live traffic is never mirrored into a table nobody asked for."""
+        cfg = self.settings.assess
+        self.assessor = Assessor(self.settings, self.router, self.net,
+                                 self.usage) if (cfg.enabled and self.router) else None
+        if self.router is not None:
+            self.router.assessor = self.assessor
 
 
 async def rebuild_net_plane(st: State) -> None:
@@ -88,13 +151,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                     limits=httpx.Limits(max_connections=100))
         st.build_net_plane()
         st.attach_router()
+        st.build_assessor()
         if st.net is not None:
             st.net.start()
+        if st.assessor is not None:
+            st.assessor.start()
+        st.build_stack()
+        if st.stack is not None:
+            st.stack.start()
         log.info("SMSocket ready: %d providers, %d keys, %d models",
                  len(st.settings.providers), len(st.pool.slots), len(st.settings.model_index()))
         yield
         if st.net is not None:
             await st.net.stop()
+        if st.stack is not None:
+            await st.stack.stop()
+        if st.assessor is not None:
+            await st.assessor.stop()
         await st.http.aclose()
         st.usage.close()
         st.catalog.close()
@@ -218,7 +291,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/concurrency")
     async def concurrency():
         """Live in-flight count, peak, queue depth, per-provider breakdown."""
-        return st.meter.snapshot(st.gate.limits())
+        snap = st.meter.snapshot(st.gate.limits())
+        # one poll must answer "was that 429 refused outright or is it parked?",
+        # so the stack view rides along even while the scheduler is disabled
+        snap["stack"] = (st.stack.snapshot(entries=0) if st.stack is not None
+                         else {"enabled": False, "depth": 0, "peak": 0,
+                               "pushed": 0, "popped": 0, "expired": 0,
+                               "dropped": 0, "policy": st.settings.stack.policy,
+                               "wait": st.settings.stack.wait, "draining": False})
+        return snap
 
     def busy(e: SMSocketBusy):
         return JSONResponse(
@@ -261,6 +342,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except UpstreamError as e:
             raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
                                                             "type": "upstream_error"}})
+
+    @app.get("/stack")
+    async def stack_state(entries: int = 20):
+        """Live parking lot: depth, peak, counters, parked callers."""
+        if st.stack is None:
+            return {"enabled": False, "policy": st.settings.stack.policy,
+                    "wait": st.settings.stack.wait, "depth": 0, "peak": 0,
+                    "pushed": 0, "popped": 0, "expired": 0, "dropped": 0,
+                    "parked_ms_peak": 0.0, "avg_parked_ms": 0.0,
+                    "by_provider": {}, "entries": [], "draining": False}
+        return st.stack.snapshot(entries=max(0, min(entries, 200)))
+
+    def need_stack():
+        if st.stack is None:
+            raise HTTPException(409, detail={"error": {
+                "message": "stack scheduler is disabled (set stack.enabled: true)",
+                "type": "stack_disabled"}})
+        return st.stack
+
+    @app.post("/stack/drain", dependencies=dep)
+    async def stack_drain(request: Request, n: int = Query(0)):
+        """Wake up to n parked callers (ops/tests): {"n": 5} or ?n=5."""
+        stack = need_stack()
+        try:
+            body = await request.json()
+        except Exception:                                   # noqa: BLE001
+            body = {}
+        # the query string wins so a shell one-liner needs no body at all
+        want = n if n else (int((body or {}).get("n", 1) or 1)
+                            if isinstance(body, dict) else 1)
+        return await stack.drain_now(max(0, want))
+
+    @app.delete("/stack/{index}", dependencies=dep)
+    async def stack_drop(index: int):
+        """Release one parked caller without a grant (it gets its 429)."""
+        out = need_stack().drop_at(index)
+        if not out.get("dropped"):
+            raise HTTPException(404, detail={"error": {
+                "message": out.get("reason", "no such entry"),
+                "type": "invalid_request_error"}})
+        return out
 
     def money(currency: str | None = None) -> dict:
         """Spend totals: per pricing currency, converted into the display one."""
@@ -332,7 +454,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def dashboard():
         # __NET_ON__ drives the discreet footer glyph: 0 -> the panel is absent
         # from the DOM entirely, so a disabled net plane leaves no trace.
-        return PAGE.replace("__NET_ON__", "1" if st.settings.clash.enabled else "0")
+        # __ASSESS_ON__ does the same for the reachability block: a gateway that
+        # measures nothing must not advertise a measuring tool.
+        return (PAGE.replace("__NET_ON__", "1" if st.settings.clash.enabled else "0")
+                .replace("__ASSESS_ON__", "1" if st.settings.assess.enabled else "0"))
 
     @app.post("/admin/reload", dependencies=dep)
     async def reload_config():
@@ -354,14 +479,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         st.pool = st.pool.rebase(new.providers) if st.pool else Pool(new.providers)
         st.gate = Gate(new.max_concurrency, new.queue_wait,
                        new.per_provider_concurrency, st.meter)
+        if st.assessor is not None:
+            await st.assessor.stop()          # old router is about to be replaced
+        parked = 0 if st.stack is None else len(st.stack.stack)
+        st.build_stack()                       # fresh gate -> fresh attachment
+        if st.stack is not None:
+            st.stack.start()
         await rebuild_net_plane(st)
         st.attach_router()
+        st.build_assessor()                    # after the router exists again
+        if st.assessor is not None:
+            st.assessor.start()
         log.info("reloaded: %d providers, %d keys", len(new.providers), len(st.pool.slots))
         return {"ok": True, "providers": len(new.providers), "keys": len(st.pool.slots),
-                "net_plane": bool(st.net is not None)}
+                "net_plane": bool(st.net is not None),
+                "stack": bool(st.stack is not None), "parked_dropped": parked,
+                "assess": bool(st.assessor is not None)}
 
     app.include_router(build_admin(st, dep))   # includes /admin/billing*
     # Discreet operator surface: not in /openapi.json, not in /docs, not in the nav.
     app.include_router(build_net(st, dep), prefix="/internal/net",
                        include_in_schema=False)
+    app.include_router(build_assess(st, dep))
     return app

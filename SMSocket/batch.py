@@ -91,6 +91,9 @@ class BatchRunner:
         if len(items) > self.max_items:
             raise BatchTooLarge(f"{len(items)} items, limit {self.max_items}")
         n = len(items)
+        stack = getattr(getattr(router, "gate", None), "stack", None)
+        reparks = int(getattr(getattr(stack, "cfg", None), "repark", 0) or 0) \
+            if stack is not None else 0
         results: list[dict] = [{"index": i, "done": False} for i in range(n)]
         sem = asyncio.Semaphore(max(1, min(int(concurrency or 8), n or 1)))
         stop = asyncio.Event()
@@ -112,24 +115,49 @@ class BatchRunner:
                     publish()
                     return
                 t0 = time.time()
-                try:
-                    body = await router.complete(item)
-                    slot.update({"status": 200, "response": body,
-                                 "usage": body.get("usage") or {}})
-                except SMSocketBusy as e:
-                    slot.update({"status": 429,
-                                 "error": {"message": str(e), "type": "rate_limited"}})
-                    if fail_fast:
-                        stop.set()
-                except Exception as e:            # NoUpstream / UpstreamError / httpx
-                    status = int(getattr(e, "status", 502) or 502)
-                    detail = getattr(e, "detail", None)
-                    slot.update({"status": status, "error": {
-                        "message": str(detail if detail is not None else e)[:500],
-                        "type": "upstream_error" if detail is not None
-                        else e.__class__.__name__}})
-                    if fail_fast and status != 429:
-                        stop.set()
+                tries = 0
+                while True:                   # a busy item re-joins the stack
+                    try:
+                        body = await router.complete(item)
+                        slot.update({"status": 200, "response": body,
+                                     "usage": body.get("usage") or {}})
+                        break
+                    except SMSocketBusy as e:
+                        # A batch item is a patient client: park it instead of
+                        # handing back a 429 result, up to `reparks` times.
+                        if stack is None or tries >= reparks:
+                            slot.update({"status": 429, "reparks": tries,
+                                         "error": {"message": str(e),
+                                                   "type": "rate_limited"}})
+                            if fail_fast:
+                                stop.set()
+                            break
+                        tries += 1
+                        slot["reparks"] = tries
+                        entry = await stack.park(str(item.get("model") or ""),
+                                                 "", "saturated",
+                                                 timeout=stack.wait, grab=False)
+                        # grab=False: the retry runs gate.acquire itself, so a
+                        # pre-granted slot would be taken twice.
+                        if not entry.granted:
+                            slot.update({"status": 429, "reparks": tries,
+                                         "error": {"message":
+                                                  f"still busy after {tries} "
+                                                  f"re-park(s)",
+                                                  "type": "rate_limited"}})
+                            if fail_fast:
+                                stop.set()
+                            break
+                    except Exception as e:    # NoUpstream / UpstreamError / httpx
+                        status = int(getattr(e, "status", 502) or 502)
+                        detail = getattr(e, "detail", None)
+                        slot.update({"status": status, "error": {
+                            "message": str(detail if detail is not None else e)[:500],
+                            "type": "upstream_error" if detail is not None
+                            else e.__class__.__name__}})
+                        if fail_fast and status != 429:
+                            stop.set()
+                        break                 # real errors do not retry here
                 slot["ms"] = round((time.time() - t0) * 1000, 1)
                 slot["done"] = True
                 u = slot.get("usage") or {}

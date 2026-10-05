@@ -311,12 +311,15 @@ class NetProbe:
             r = await client.head(url, timeout=to,
                                   headers={"user-agent": "SMSocket/net-probe"})
             ms = (time.perf_counter() - t0) * 1000
-            if r.status_code in (400, 405, 501):        # HEAD refused -> GET
+            if r.status_code in (400, 404, 405, 501):   # HEAD refused -> GET
                 r = await client.get(url, timeout=to, headers={
                     "user-agent": "SMSocket/net-probe"})
                 ms = (time.perf_counter() - t0) * 1000
-            ok = r.status_code < 400
-            return ok, ms, "" if ok else f"HTTP {r.status_code}"
+            # Any HTTP answer means the path carries traffic: a 404 is a missing
+            # route, a 5xx is the provider's day, and neither is a network fault.
+            # Only a proxy that demands auth (407) is a path we cannot use.
+            ok = r.status_code != 407
+            return ok, ms, "" if ok else "HTTP 407 (proxy auth required)"
         except httpx.RequestError as e:
             return False, (time.perf_counter() - t0) * 1000, \
                 f"{type(e).__name__}: {e}"[:MAX_BODY]

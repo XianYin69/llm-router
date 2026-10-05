@@ -23,9 +23,14 @@ class NoUpstream(Exception):
 
 
 class UpstreamError(Exception):
-    def __init__(self, status: int, detail, slot: KeySlot | None = None):
+    def __init__(self, status: int, detail, slot: KeySlot | None = None,
+                 upstream_status: int = 0):
         super().__init__(str(detail))
+        # `status` is what the client sees (a failover is reported as 502);
+        # `upstream_status` is what the provider actually answered, which is
+        # the difference between "blocked here" and "having a bad day".
         self.status, self.detail, self.slot = status, detail, slot
+        self.upstream_status = int(upstream_status or 0)
 
 
 class Router:
@@ -45,6 +50,7 @@ class Router:
         self.gate = gate or Gate()
         self.net = net
         self.egress = egress if egress is not None else getattr(net, "registry", None)
+        self.assessor = None        # assess.Assessor, set by State.attach_router
 
     def plan(self, alias: str) -> list[KeySlot]:
         cands = self.pool.candidates(alias, self.s.strategy, net=self._net())
@@ -56,8 +62,21 @@ class Router:
         """The plane only influences ranking when it is enabled *and* smart."""
         return self.net if getattr(self.net, "smart", False) else None
 
-    def pick_egress(self, provider_name: str) -> tuple[str, httpx.AsyncClient]:
-        """(egress id, client) for a provider - ("direct", st.http) by default."""
+    def pick_egress(self, provider_name: str,
+                    force: str = "") -> tuple[str, httpx.AsyncClient]:
+        """(egress id, client) for a provider - ("direct", st.http) by default.
+
+        `force` names one path and pins the call to it: that is how a probe
+        measures "can this model be reached over *this* egress" instead of
+        whatever the plane happens to consider best right now.
+        """
+        if force and force != DIRECT:
+            if self.egress is not None:
+                return force, self.egress.client_for(force)
+            log.debug("cannot force egress '%s': no egress registry", force)
+            return DIRECT, self.http
+        if force == DIRECT:
+            return DIRECT, self.http
         if self.net is None or not getattr(self.net.cfg, "enabled", False):
             return DIRECT, self.http
         try:
@@ -97,6 +116,13 @@ class Router:
                        cost=cd["amount"], cost_currency=cd["currency"],
                        cost_display=cd["display"],
                        display_currency=cd["display_currency"], egress=egress)
+        a = getattr(self, "assessor", None)
+        if a is not None:
+            # "daily conversation" evaluation: real traffic is the sample, so
+            # measuring what users feel costs no extra upstream call.
+            a.observe(alias=alias, provider=slot.provider.name, egress=egress,
+                      ms=round((time.time() - t0) * 1000, 1), status=status,
+                      usage=u, stream=stream, error=error)
 
     async def embeddings(self, payload: dict, egress_out: dict | None = None) -> dict:
         # OpenAI-compatible /v1/embeddings, same pool + failover rules as chat.
@@ -139,13 +165,14 @@ class Router:
             return data
         raise last or UpstreamError(502, "all embedding upstreams failed")
 
-    async def complete(self, payload: dict, egress_out: dict | None = None) -> dict:
+    async def complete(self, payload: dict, egress_out: dict | None = None,
+                       force_egress: str = "") -> dict:
         alias = str(payload.get("model") or "")
         last: UpstreamError | None = None
         for slot in self.plan(alias):
             t0 = time.time()
             lease = await self.gate.acquire(alias, slot.provider.name)
-            eid, client = self.pick_egress(slot.provider.name)
+            eid, client = self.pick_egress(slot.provider.name, force_egress)
             if egress_out is not None:
                 egress_out["egress"] = eid
             try:
@@ -156,7 +183,8 @@ class Router:
                     detail = _safe_detail(r)
                     if r.status_code not in RETRY_STATUS:
                         raise UpstreamError(r.status_code, detail, slot)
-                    last = UpstreamError(502, f"{slot.label}: {detail}", slot)
+                    last = UpstreamError(502, f"{slot.label}: {detail}", slot,
+                                         upstream_status=r.status_code)
                     self._account(slot, alias, r.status_code, t0, None, 0, str(detail),
                                   egress=eid)
                     log.warning("failover from %s (%s)", slot.label, detail)
@@ -178,7 +206,7 @@ class Router:
         raise last or UpstreamError(502, "all upstreams failed")
 
 
-    async def open_stream(self, payload: dict):
+    async def open_stream(self, payload: dict, force_egress: str = ""):
         """Try candidates until one opens a stream; returns (slot, alias, t0, response).
 
         The chosen egress travels on the response (`_sms_egress`), the same way
@@ -190,7 +218,7 @@ class Router:
         for slot in self.plan(alias):
             t0 = time.time()
             lease = await self.gate.acquire(alias, slot.provider.name)
-            eid, client = self.pick_egress(slot.provider.name)
+            eid, client = self.pick_egress(slot.provider.name, force_egress)
             try:
                 r = await client.send(self._request(slot, alias, payload, True, client),
                                       stream=True)
@@ -201,7 +229,8 @@ class Router:
                     detail = _safe_detail(r)
                     if r.status_code not in RETRY_STATUS:
                         raise UpstreamError(r.status_code, detail, slot)
-                    last = UpstreamError(502, f"{slot.label}: {detail}", slot)
+                    last = UpstreamError(502, f"{slot.label}: {detail}", slot,
+                                         upstream_status=r.status_code)
                     continue
                 r._sms_lease = lease          # released when the stream ends
                 r._sms_egress = eid           # echoed as x-socket-egress

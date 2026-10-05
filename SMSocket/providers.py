@@ -36,6 +36,18 @@ class KeySlot:
                 return False
         return True
 
+    def rpm_headroom(self, now: float | None = None) -> int | None:
+        """Requests still allowed in this 60s window (None = no rpm cap).
+
+        Prunes the window like `available()` does, so the stack scheduler can
+        ask "is this provider rate-limited right now?" without consuming a key.
+        """
+        if not self.provider.max_rpm:
+            return None
+        now = time.time() if now is None else now
+        self._window = [t for t in self._window if now - t < 60]
+        return max(0, self.provider.max_rpm - len(self._window))
+
     def touch(self) -> None:
         self._window.append(time.time())
 

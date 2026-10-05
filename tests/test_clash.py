@@ -780,3 +780,38 @@ def cfg_dict(**kw):
     return {"enabled": c.enabled, "controller": c.controller, "secret": c.secret,
             "mixed_port": c.mixed_port, "interval": c.interval, "timeout": c.timeout,
             "mode": c.mode, "smart": c.smart}
+
+
+def test_probe_ok_means_the_path_carried_traffic_not_that_a_route_exists():
+    """A 404 is a missing route, not a dead path.
+
+    Scoring HTTP >=400 as "unreachable" made every provider whose base_url has
+    no handler look dead over *all* paths, so the plane preferred a proxy for
+    no reason. Only a transport failure or a proxy that demands auth (407)
+    means the path itself is unusable.
+    """
+    def h(request):
+        if request.url.path == "/missing":
+            return httpx.Response(404, json={"error": "no route"})
+        if request.url.path == "/boom":
+            return httpx.Response(503, json={"error": "provider having a day"})
+        if request.url.path == "/needs-auth":
+            return httpx.Response(407)
+        return httpx.Response(200)
+
+    c = cfg()
+    shared = httpx.AsyncClient(transport=httpx.MockTransport(h))
+    reg = EgressRegistry(shared, c, client_factory=lambda p: httpx.AsyncClient(
+        transport=httpx.MockTransport(h)))
+    probe = NetProbe(c, None, reg)
+
+    async def run():
+        ok, _, err = await probe.measure(DIRECT, "http://api.test/missing")
+        assert ok is True and err == "", (ok, err)      # 404 -> path is alive
+        ok, _, err = await probe.measure(DIRECT, "http://api.test/boom")
+        assert ok is True and err == "", (ok, err)      # 5xx is the provider's day
+        ok, _, err = await probe.measure(DIRECT, "http://api.test/needs-auth")
+        assert ok is False and "407" in err, (ok, err)  # proxy auth = unusable path
+        await reg.aclose()
+
+    asyncio.run(run())

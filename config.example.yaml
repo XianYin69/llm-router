@@ -111,3 +111,36 @@ clash:
   smart: true                      # rank egress by measured delay + fail ratio
   min_delay_ms: 20                 # a proxy must beat direct by this much to win
   fail_ratio: 0.5                  # above this a path counts as unhealthy
+
+# ---- v0.4 stack scheduler (optional, OFF by default) ----------------------
+# Instead of refusing a request the moment a limit bites, park it on a stack
+# and wake it as soon as capacity frees up. Disabled = today's behaviour:
+# saturated caller -> immediate 429.
+stack:
+  enabled: false                   # true = park instead of refusing
+  max_depth: 1000                  # parked callers at once, then 429 anyway
+  wait: 120                        # seconds one caller accepts being parked
+  policy: lifo                     # lifo | fifo | priority
+  park_on: [saturated, rpm, provider_saturated]   # which limits may park
+  interval: 0.25                   # drain poll (seconds)
+  repark: 3                        # batch items: re-parks after a 429
+
+# ---- v0.4 model + reachability assessment (optional, OFF by default) ------
+# Two sources feed one table: `live` mirrors the traffic you already serve
+# (free, no extra calls), `probe` really calls each model over each egress
+# path so you learn whether a model is reachable from *this* network at all.
+assess:
+  enabled: false                   # true = mirror live calls + schedule sweeps
+  interval_s: 3600                 # hours between scheduled sweeps
+  at: ""                           # "HH:MM" daily slot (empty = interval only)
+  models: []                       # empty = every published alias
+  providers: []                    # empty = every provider
+  egress: auto                     # auto = direct + every clash path, or one id
+  prompt: "Reply with exactly one word: ok"
+  max_tokens: 8                    # probes stay tiny on purpose
+  concurrency: 4                   # parallel probes
+  timeout: 20                      # seconds per probe before it counts as failed
+  live: true                       # harvest from real traffic
+  live_sample: 1.0                 # 0..1 share of live calls recorded
+  slow_ms: 8000                    # p50 above this = verdict "slow"
+  window_s: 86400                  # report window (default: last 24h)
