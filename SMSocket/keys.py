@@ -3,18 +3,21 @@
 The gateway must always answer "what key do I use?" in the startup banner, so a
 missing master_keys section is not an error - we mint a random key once and keep
 it in a file next to the config, reused on every restart / --reload subprocess.
-Set LLMROUTER_NO_KEY=1 (run.py --no-key) to opt out and run unauthenticated.
+Set SMSSOCKET_NO_KEY=1 (run.py --no-key) to opt out and run unauthenticated.
 """
 from __future__ import annotations
 import os
 import secrets
 from pathlib import Path
 
-KEY_FILE = "router.key"
-PREFIX = "sk-router-"
-ENV_NO_KEY = "LLMROUTER_NO_KEY"
-ENV_KEY = "LLMROUTER_MASTER_KEY"
-ENV_KEY_FILE = "LLMROUTER_KEY_FILE"
+from .config import envv
+
+KEY_FILE = "smsocket.key"
+LEGACY_KEY_FILE = "router.key"
+PREFIX = "sk-socket-"
+ENV_NO_KEY = "SMSSOCKET_NO_KEY"
+ENV_KEY = "SMSSOCKET_MASTER_KEY"
+ENV_KEY_FILE = "SMSSOCKET_KEY_FILE"
 
 
 def new_key() -> str:
@@ -23,29 +26,32 @@ def new_key() -> str:
 
 def key_path(config_path: os.PathLike | str | None = None) -> Path:
     """Where the generated key lives: env override, else beside the config file."""
-    env = os.environ.get(ENV_KEY_FILE)
+    env = envv(ENV_KEY_FILE)
     if env:
         return Path(env)
     base = Path(config_path) if config_path else Path.cwd()
     if base.is_file():
         base = base.parent
-    return base / KEY_FILE
+    new = base / KEY_FILE
+    if not new.exists() and (base / LEGACY_KEY_FILE).exists():
+        return base / LEGACY_KEY_FILE   # pre-rename key file keeps working
+    return new
 
 
 def ensure_master_key(settings, config_path=None, rotate: bool = False) -> str:
     """Fill settings.master_keys if empty; return source label.
 
     'config'      - master_keys came from config.yaml (unchanged)
-    'env'         - taken from LLMROUTER_MASTER_KEY
-    'generated'   - random key minted now and written to router.key
-    'reused'      - read back from router.key (restart / reload keeps one key)
-    'disabled'    - no key, gateway open (LLMROUTER_NO_KEY / --no-key)
+    'env'         - taken from SMSSOCKET_MASTER_KEY
+    'generated'   - random key minted now and written to smsocket.key
+    'reused'      - read back from smsocket.key (restart / reload keeps one key)
+    'disabled'    - no key, gateway open (SMSSOCKET_NO_KEY / --no-key)
     """
     if getattr(settings, "master_keys", None):
         return "config"
-    if os.environ.get(ENV_NO_KEY):
+    if envv(ENV_NO_KEY):
         return "disabled"
-    env_key = os.environ.get(ENV_KEY)
+    env_key = envv(ENV_KEY)
     if env_key:
         settings.master_keys = [env_key]
         return "env"

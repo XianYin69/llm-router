@@ -11,3 +11,5 @@ Dockerfile.local
 .idea/
 .vscode/
 router.key
+smsocket.key
+runtime/

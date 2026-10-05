@@ -1,18 +1,50 @@
-# llm-router v0.1 - copy to config.yaml and fill in your keys.
+# SMSocket v0.3 - copy to config.yaml and fill in your keys.
 # Secrets stay out of the file: ${ENV_VAR} is expanded from the environment.
 
 listen: 127.0.0.1:8000          # host:port the gateway binds
-master_keys:                    # client-facing keys ("sk-router-..."); empty = no auth
-  - ${ROUTER_MASTER_KEY}
+master_keys:                    # client-facing keys ("sk-socket-..."); empty = no auth
+                                  # (empty + no env -> a random key is minted into smsocket.key)
+  - ${SMSSOCKET_MASTER_KEY}     # or the literal key; empty master_keys -> smsocket.key is minted
 strategy: priority              # priority | round_robin | weighted
 retry: 2                        # extra attempts after the first failure
 cooldown: 60                    # seconds a failing key is skipped
 db_path: usage.sqlite3          # call log for /stats + /v1/usage + dashboard
-currency: USD                   # label only; pricing numbers are in this currency
-pricing:                        # per 1M tokens, used to estimate cost per call
+currency: USD                   # legacy alias of billing.currency (billing: wins when present)
+
+# ---- v0.3: billing currency + exchange rates ------------------------------
+billing:
+  currency: CNY                   # every total (/stats, /v1/usage, dashboard) shows in this
+  base: USD                       # rates below are "units of <currency> per 1 <base>"
+  precision: 6
+  rates_url: ""                   # optional: POST /admin/billing/rates/refresh pulls a table
+  rates:
+    USD: 1
+    CNY: 7.1
+    EUR: 0.92
+    GBP: 0.78
+    JPY: 155
+    KRW: 1350
+
+# ---- v0.3: concurrency (admission gate + live meter) ----------------------
+max_concurrency: 0                # 0 = unlimited simultaneous upstream calls
+queue_wait: 30                    # seconds a caller may wait for a free slot, then 429
+per_provider_concurrency: 0       # 0 = no per-provider cap (GET /concurrency to watch)
+
+# ---- v0.3: parallel batch / async jobs ------------------------------------
+# POST /v1/batch {"requests":[{model,messages,...}], "concurrency":8, "fail_fast":false}
+# POST /v1/batch?async=1 -> 202 {"job":"job_x"} ; GET /v1/batches/{job}?wait=5 ; DELETE to cancel
+
+# ---- v0.3: discovery ------------------------------------------------------
+# POST /admin/discover {"providers":["openai"],"probe_params":true,"async":1}
+# GET /admin/discover/status ; GET /admin/models (cached catalog) ;
+# POST /admin/models/apply {"providers":["openai"]} -> publishes probed ids as new aliases
+#                                       (add-only: an existing alias is never overwritten)
+
+pricing:                          # per 1M tokens; `currency:` per row = what the vendor bills in
   '*': {prompt: 0.15, completion: 0.60}     # fallback row for unlisted aliases
-  gpt-4o-mini: {prompt: 0.15, completion: 0.60}
-  claude-3-5-sonnet: {prompt: 3.00, completion: 15.00}
+  gpt-4o-mini: {prompt: 0.15, completion: 0.60, currency: USD}
+  claude-3-5-sonnet: {prompt: 3.00, completion: 15.00, currency: USD}
+  deepseek-chat: {prompt: 0.27, completion: 1.10, currency: CNY}
 log_level: INFO
 
 providers:
@@ -57,3 +89,25 @@ providers:
     models:
       gpt-4o-mini: gpt-4o-mini
     enabled: false               # flip to true to activate
+
+# ---- v0.4 net plane (optional, OFF by default) ---------------------------
+# Route upstream calls through a clash external-controller: score every egress
+# path (direct vs. proxy/node) and send each provider through the best one.
+# Operator surface is /internal/net/* - deliberately absent from OpenAPI/docs.
+clash:
+  enabled: false                   # true = build the net plane at startup
+  controller: http://127.0.0.1:9090   # clash external-controller (mixed api port)
+  secret: ${CLASH_SECRET}          # external-controller secret, keep in the env
+  mixed_port: 7890                 # clash mixed-port -> http://<controller-host>:7890
+  # proxy_url: http://127.0.0.1:7890   # set to override the mixed_port guess
+  health_url: https://www.google.com/generate_204
+  timeout: 5                       # seconds per controller call / probe
+  interval: 60                     # seconds between background re-probes
+  mode: auto                       # auto | direct | proxy (force one plane)
+  groups: [PROXY-GRP]              # proxy-provider groups to track and score
+  provider_proxy:                  # static hint: provider -> group or group/node
+    openai: PROXY-GRP
+    anthropic: PROXY-GRP/us-east-2
+  smart: true                      # rank egress by measured delay + fail ratio
+  min_delay_ms: 20                 # a proxy must beat direct by this much to win
+  fail_ratio: 0.5                  # above this a path counts as unhealthy

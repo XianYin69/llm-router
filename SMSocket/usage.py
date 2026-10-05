@@ -9,7 +9,9 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS calls(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts REAL, alias TEXT, upstream TEXT, provider TEXT, key TEXT,
   status INTEGER, ms REAL, prompt INTEGER, completion INTEGER,
-  total INTEGER, stream INTEGER, error TEXT, cost REAL DEFAULT 0)"""
+  total INTEGER, stream INTEGER, error TEXT, cost REAL DEFAULT 0,
+  cost_currency TEXT DEFAULT "", cost_display REAL DEFAULT 0,
+  display_currency TEXT DEFAULT "", egress TEXT DEFAULT "")"""
 
 
 class Usage:
@@ -21,13 +23,21 @@ class Usage:
         cols = {r["name"] for r in self.con.execute("PRAGMA table_info(calls)")}
         if "cost" not in cols:            # migrate v0.1 databases in place
             self.con.execute("ALTER TABLE calls ADD COLUMN cost REAL DEFAULT 0")
+        for name, decl in (("cost_currency", "TEXT DEFAULT ''"),
+                           ("cost_display", "REAL DEFAULT 0"),
+                           ("display_currency", "TEXT DEFAULT ''"),
+                           ("egress", "TEXT DEFAULT ''")):
+            if name not in cols:      # migrate v0.2 databases in place
+                self.con.execute(f"ALTER TABLE calls ADD COLUMN {name} {decl}")
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts)")
         self.con.commit()
 
     def log(self, **kw) -> None:
         row = {"ts": time.time(), "alias": "", "upstream": "", "provider": "",
                "key": "", "status": 0, "ms": 0.0, "prompt": 0, "completion": 0,
-               "total": 0, "stream": 0, "error": "", "cost": 0.0}
+               "total": 0, "stream": 0, "error": "", "cost": 0.0,
+               "cost_currency": "", "cost_display": 0.0, "display_currency": "",
+               "egress": ""}
         row.update(kw)
         cols = ",".join(row)
         ph = ",".join("?" * len(row))
@@ -41,7 +51,8 @@ class Usage:
 
     def daily(self, days: int = 14) -> list[dict]:
         q = ("SELECT date(ts,'unixepoch') d, count(*) calls, sum(total) tokens, "
-             "round(sum(cost),6) cost, sum(status>=400) errors FROM calls "
+             "round(sum(cost),8) cost, round(sum(cost_display),8) display, "
+             "max(display_currency) currency, sum(status>=400) errors FROM calls "
              "GROUP BY d ORDER BY d DESC LIMIT ?")
         return [dict(r) for r in self.con.execute(q, (days,))]
     def summary(self) -> dict:
@@ -56,6 +67,14 @@ class Usage:
                 "models": [dict(r) for r in self.con.execute(by_model)],
                 "total": self.con.execute("SELECT count(*) c, sum(total) t, "
                                          "round(sum(cost),6) cost FROM calls").fetchone()}
+
+    def by_currency(self) -> list[dict]:
+        """Spend grouped by the currency each price row was expressed in."""
+        q = ("SELECT COALESCE(NULLIF(cost_currency,''),'USD') currency, count(*) calls, "
+             "sum(total) tokens, round(sum(cost),8) cost, "
+             "round(sum(cost_display),8) display FROM calls GROUP BY currency "
+             "ORDER BY display DESC")
+        return [dict(r) for r in self.con.execute(q)]
 
     def close(self) -> None:
         with self._lock:

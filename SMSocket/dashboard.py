@@ -185,7 +185,24 @@ textarea{font:12px/1.5 ui-monospace,Consolas,monospace;padding:6px 8px;backgroun
 td button{font-size:11px;padding:3px 8px;margin-right:4px}
 @media(max-width:780px){.cred{width:100%}.nav{width:100%}}
 """
-CSS = _BASE + _A + _B + _C + _D + _NAV
+_NET = """
+/* discreet net plane: footer glyph + slide-over panel, skin-agnostic (vars only) */
+.netglyph{position:fixed;right:12px;bottom:10px;z-index:40;font-size:11px;opacity:.45;
+ background:transparent;border:0;color:var(--fg);cursor:pointer;padding:3px 6px}
+.netglyph:hover{opacity:.95}
+.netglyph.off{display:none}
+.netmask{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:41;display:none}
+.netmask.on{display:block}
+.netpanel{position:fixed;top:0;right:0;bottom:0;width:min(430px,94vw);z-index:42;
+ background:var(--bg);border-left:1px solid var(--edge);box-shadow:var(--drop);
+ padding:12px 14px;overflow:auto;transform:translateX(100%);transition:transform .18s ease}
+.netpanel.on{transform:translateX(0)}
+.netpanel h2{margin:0 0 8px;font-size:15px}
+.netrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.netpanel table{width:100%;font-size:12px}
+.netpanel .muted{opacity:.65;font-size:11px}
+"""
+CSS = _BASE + _A + _B + _C + _D + _NAV + _NET
 JS = """
 const K=()=>document.getElementById('key').value.trim();
 const hdr=()=>K()?{Authorization:'Bearer '+K()}:{};
@@ -209,14 +226,17 @@ async function send(u,m,b){const r=await fetch(u,{method:m,headers:Object.assign
   throw new Error(msg)}return d}
 """
 JS += """
-const PAGES=['overview','usage','providers','settings'];
-const PKEY='llm-router.page';
+const PAGES=['overview','usage','providers','socket','discover','settings'];
+const PKEY='SMSocket.page';
 function go(p){if(PAGES.indexOf(p)<0)p='overview';
  document.querySelectorAll('.page').forEach(el=>el.classList.toggle('on',el.id==='page-'+p));
  document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.p===p));
  try{localStorage.setItem(PKEY,p)}catch(e){}
  if(location.hash!=='#'+p)try{history.replaceState(null,'','#'+p)}catch(e){}
  if(p==='providers')loadConfig();
+ if(p==='socket'){loadSocket();tickSocket()}
+ if(p==='discover'){loadProvidersForProbe();loadCatalog()}
+
  if(p==='settings'){loadSelf();loadSettings()}}
 let SELF={},REVEAL=false;
 function paintSelf(){document.getElementById('baseurl').textContent=SELF.base_url||'-';
@@ -244,7 +264,7 @@ function fallback(txt,done){const ta=document.createElement('textarea');ta.value
 """
 JS += """
 async function refresh(){toast('');
- try{const [s,p,mods]=await Promise.all([j('/stats'),j('/pool'),j('/v1/models')]);
+ try{const [s,p,mods,x]=await Promise.all([j('/stats'),j('/pool'),j('/v1/models'),j('/concurrency')]);
   document.getElementById('calls').textContent=s.calls;
   document.getElementById('tokens').textContent=s.tokens;
   document.getElementById('cost').textContent=(+s.cost||0).toFixed(4)+' '+(s.currency||'');
@@ -260,6 +280,9 @@ async function refresh(){toast('');
    stream:r.stream?'是':'否'})),['ts','alias','provider','status','ms','total','cost','stream']);
   try{const u=await j('/v1/usage?days=14');tbl('daily',u.daily,['d','calls','tokens','cost','errors'])}
   catch(e){tbl('daily',[],['d','calls','tokens','cost','errors'])}
+  document.getElementById('xactive').textContent=x.active;
+  document.getElementById('xpeak').textContent=x.peak;
+  document.getElementById('xcurrency').textContent=(s.currency||'-');
   document.getElementById('strategy').textContent=p.strategy;
   toast('已刷新 · '+new Date().toLocaleTimeString())
  }catch(e){toast('数据加载失败 · '+e.message)}}
@@ -323,7 +346,9 @@ function editProv(n){const p=(CFG.providers||[]).filter(x=>x.name===n)[0];if(!p)
  document.getElementById('p_note').textContent='正在编辑：'+n+'（密钥请用下方按钮增删）';
  document.getElementById('pf').scrollIntoView({block:'center'})}
 async function saveGlobals(){const body={listen:gv('g_listen'),strategy:gv('g_strategy'),
- retry:+gv('g_retry')||0,cooldown:+gv('g_cd')||0,currency:gv('g_cur')};
+ retry:+gv('g_retry')||0,cooldown:+gv('g_cd')||0,currency:gv('g_cur'),
+ max_concurrency:+gv('g_maxc')||0,queue_wait:+gv('g_qw')||0,
+ per_provider_concurrency:+gv('g_ppc')||0};
  const pr={};lines(gv('g_pricing')).forEach(t=>{const a=t.split('=');if(a.length===2){
   const v=(a[1]||'').split('/');pr[a[0].trim()]={prompt:+v[0]||0,completion:+(v[1]||0)||0}}});
  body.pricing=pr;
@@ -332,7 +357,7 @@ async function saveGlobals(){const body={listen:gv('g_listen'),strategy:gv('g_st
   toast('全局设置已保存并热加载 · '+JSON.stringify(d.applied))}catch(e){toast('保存失败 · '+e.message)}}
 """
 JS += """
-const SKIN_KEY='llm-router.skin';
+const SKIN_KEY='SMSocket.skin';
 function setSkin(k){if(!/[abcd]/.test(k))k='a';
  document.body.className='skin-'+k;
  try{localStorage.setItem(SKIN_KEY,k)}catch(e){}
@@ -343,6 +368,10 @@ async function loadSettings(){try{const c=await j('/admin/config');CFG=c;
  document.getElementById('g_retry').value=c.retry;
  document.getElementById('g_cd').value=c.cooldown;
  document.getElementById('g_cur').value=c.currency||'USD';
+ document.getElementById('g_maxc').value=c.max_concurrency||0;
+ document.getElementById('g_qw').value=c.queue_wait==null?30:c.queue_wait;
+ document.getElementById('g_ppc').value=c.per_provider_concurrency||0;
+ fillBilling(c.billing||{});
  document.getElementById('g_pricing').value=Object.keys(c.pricing||{}).map(k=>{
   const r=c.pricing[k]||{};return k+'='+r.prompt+'/'+r.completion}).join(String.fromCharCode(10));
  document.getElementById('g_path').textContent=c.path||'-';
@@ -358,19 +387,215 @@ document.addEventListener('click',ev=>{const b=ev.target.closest('button[data-a]
  else if(a==='delkey')delKey(n,b.dataset.i)});
 """
 JS += """
-(function(){let k='a';try{k=localStorage.getItem(SKIN_KEY)||'a'}catch(e){}setSkin(k);
+// ---- 并发与批量 ----------------------------------------------------------
+let AUTO=false,TMR=null,LASTJOB='';
+function num(x,d){return (x==null||x===''||isNaN(x))?(d===undefined?'-':d):x}
+async function loadSocket(){try{const x=await j('/concurrency');
+ [['active','s_active'],['queued','s_queued'],['peak','s_peak'],['total','s_total'],
+  ['rejected','s_rej'],['rps','s_rps'],['errors','s_err'],['avg_wait_ms','s_wait']]
+  .forEach(([k,id])=>{const el=document.getElementById(id);if(el)el.textContent=num(x[k],0)});
+ document.getElementById('s_max').textContent=x.max_concurrency||'不限';
+ document.getElementById('s_ppc').textContent=x.per_provider_concurrency||'不限';
+ document.getElementById('s_qw').textContent=(x.queue_wait||0)+'s';
+ document.getElementById('s_sat').textContent=x.saturated?'已饱和（新请求排队/429）':'有余量';
+ const rows=x.by_provider||{},keys=Object.keys(rows),bp=document.getElementById('sprov');
+ bp.innerHTML=keys.length?('<tr><th>提供方</th><th>在途</th><th>峰值</th><th>累计</th><th>失败</th></tr>'+
+  keys.map(k=>'<tr><td><b>'+esc(k)+'</b></td><td>'+rows[k].active+'</td><td>'+rows[k].peak+
+   '</td><td>'+rows[k].total+'</td><td>'+rows[k].errors+'</td></tr>').join(''))
+  :'<tr><td class=empty colspan=5>暂无在途数据</td></tr>';
+ }catch(e){toast('并发数据加载失败 · '+e.message)}}
+function tickSocket(){if(!AUTO)return;loadSocket();TMR=setTimeout(tickSocket,1000)}
+function toggleAuto(){AUTO=!AUTO;document.getElementById('s_auto').textContent='自动刷新：'+(AUTO?'开':'关');
+ clearTimeout(TMR);if(AUTO)tickSocket()}
+function batchItems(){return lines(gv('q_body')).map((ln,i)=>{
+ if(ln[0]==='{'){try{const o=JSON.parse(ln);o.custom_id=o.custom_id||('c'+i);return o}catch(e){return null}}
+ return {custom_id:'c'+i,model:(CFG.models||[])[0]||'demo',
+  messages:[{role:'user',content:ln}]}}).filter(Boolean)}
+function resRows(rs){return (rs||[]).map(r=>({index:r.index,custom_id:r.custom_id,model:r.model,
+ status:r.status,ms:r.ms,tokens:(r.usage||{}).total_tokens||0,
+ cost:r.cost?(+r.cost.display).toFixed(6)+' '+r.cost.display_currency:'-',
+ err:(r.error||{}).message||(r.cancelled?'已取消':(r.skipped?'已跳过':''))}))}
+async function runBatch(){const items=batchItems();
+ if(!items.length){toast('请求列表为空（每行一条提示词或 JSON）');return}
+ const body={requests:items,concurrency:+gv('q_conc')||8,fail_fast:gv('q_ff')==='1'};
+ const note=document.getElementById('q_note');note.textContent='发送中 '+items.length+' 条…';
+ try{
+  if(gv('q_mode')==='async'){const d=await send('/v1/batch?async=1','POST',body);LASTJOB=d.job;
+   note.textContent='作业已受理 '+d.job+' · 点「轮询作业」看进度';
+   tbl('qres',[],['index','custom_id','model','status','ms','tokens','cost','err']);showJobs();return}
+  const d=await send('/v1/batch','POST',body),sm=d.summary||{};
+  note.textContent='完成：成功 '+sm.ok+' / 失败 '+sm.failed+' / 跳过 '+(sm.skipped||0)+
+   ' · 词元 '+sm.tokens+' · 费用 '+(+sm.cost||0).toFixed(6)+' '+(sm.currency||'')+
+   ' · 墙钟 '+sm.wall_ms+'ms（平均单条 '+sm.avg_ms+'ms）';
+  tbl('qres',resRows(d.results),
+   ['index','custom_id','model','status','ms','tokens','cost','err']);
+ }catch(e){note.textContent='失败 · '+e.message}}
+async function showJobs(){try{const d=await j('/v1/batches');
+ tbl('qjobs',d.jobs.map(x=>({job:x.job,status:x.status,done:x.completed+' / '+x.total,
+  failed:x.failed,concurrency:x.concurrency,elapsed:x.elapsed+'s'})),
+  ['job','status','done','failed','concurrency','elapsed'])}catch(e){}}
+async function pollJob(){if(!LASTJOB){toast('还没有异步作业，先用「异步作业」模式发送');return}
+ try{const d=await j('/v1/batches/'+LASTJOB+'?wait=5');
+  document.getElementById('q_note').textContent=d.status+' · '+d.completed+'/'+d.total+
+   ' · 进度 '+(d.progress*100).toFixed(0)+'%';
+  tbl('qres',resRows(d.results),
+   ['index','custom_id','model','status','ms','tokens','cost','err']);
+  showJobs()}catch(e){toast('轮询失败 · '+e.message)}}
+"""
+JS += """
+// ---- 计费货币 ------------------------------------------------------------
+function optList(id,arr,cur){const s=document.getElementById(id);if(!s)return;
+ s.innerHTML=(arr||[]).map(c=>'<option value='+c+'>'+c+'</option>').join('');
+ if(cur)s.value=cur}
+function fillBilling(b){b=b||{};const cs=Object.keys(b.rates||{}).sort();
+ optList('b_cur',cs,b.currency||'USD');optList('b_base',cs,b.base||'USD');
+ optList('c_from',cs,'USD');optList('c_to',cs,b.currency||'USD');
+ const g=(id,v)=>{const el=document.getElementById(id);if(el)el.value=v};
+ g('b_prec',b.precision==null?6:b.precision);g('b_url',b.rates_url||'');
+ g('b_rates',Object.keys(b.rates||{}).map(k=>k+'='+b.rates[k]).join(String.fromCharCode(10)))}
+async function loadBilling(){try{const d=await j('/admin/billing');fillBilling(d.billing);
+  const n=document.getElementById('b_note');
+  if(n)n.textContent='当前显示币种 '+d.currency+' '+d.symbol}catch(e){toast('计费设置加载失败 · '+e.message)}}
+async function saveBilling(){const rates={};
+ lines(gv('b_rates')).forEach(x=>{const a=x.split('=');
+  if(a.length===2)rates[a[0].trim().toUpperCase()]=+a[1]||0});
+ const body={billing:{currency:gv('b_cur'),base:gv('b_base'),precision:+gv('b_prec')||6,
+  rates_url:gv('b_url'),rates:rates}};
+ try{const d=await send('/admin/billing','PUT',body);fillBilling(d.billing);
+  document.getElementById('b_note').textContent='已保存 · 显示币种 '+d.billing.currency+
+   ' · '+Object.keys(d.billing.rates).length+' 条汇率';refresh()}
+ catch(e){document.getElementById('b_note').textContent='保存失败 · '+e.message}}
+async function refreshRates(){try{const d=await send('/admin/billing/rates/refresh','POST',
+  gv('b_url')?{url:gv('b_url')}:{});fillBilling(d.billing);
+  document.getElementById('b_note').textContent='已更新 '+d.updated+' 条汇率（'+d.source+'）'}
+ catch(e){document.getElementById('b_note').textContent='拉取失败 · '+e.message}}
+async function convertTry(){try{const d=await j('/admin/billing/convert?amount='+
+   encodeURIComponent(gv('c_amt')||1)+'&frm='+gv('c_from')+'&to='+gv('c_to'));
+  document.getElementById('c_out').textContent=d.converted+' '+d.to+
+   '（1 '+d.from+' = '+d.rate+' '+d.to+'）'}
+ catch(e){document.getElementById('c_out').textContent='换算失败'}}
+"""
+JS += """
+// ---- 模型探测 ------------------------------------------------------------
+let DREP=[];
+async function loadProvidersForProbe(){try{const c=await j('/admin/config');CFG=c;
+ const s=document.getElementById('d_prov');
+ s.innerHTML=(c.providers||[]).map(p=>'<option value='+esc(p.name)+'>'+esc(p.name)+
+  '（'+(p.key_count||0)+' 密钥）</option>').join('')||'<option value=adhoc>无提供方</option>';
+ }catch(e){toast('提供方加载失败 · '+e.message)}}
+async function startDiscover(){const body={providers:[gv('d_prov')],
+ concurrency:+gv('d_conc')||8,timeout:+gv('d_to')||30,max_models:+gv('d_max')||200,
+ test_prompt:gv('d_prompt'),probe_params:gv('d_params')==='1',
+ probe_stream:gv('d_stream')==='1',probe_embeddings:gv('d_emb')==='1',async:1};
+ const ms=gv('d_models');if(ms)body.models=ms.split(/[,;\\s]+/).filter(Boolean);
+ try{const d=await send('/admin/discover','POST',body);
+  document.getElementById('d_note').textContent='探测已启动 · '+(d.providers||[]).join(',');
+  pollDiscover()}catch(e){document.getElementById('d_note').textContent='启动失败 · '+e.message}}
+async function pollDiscover(){try{const s=await j('/admin/discover/status');
+ const el=document.getElementById('d_prog');
+ if(s.status==='idle'){el.textContent='未开始';return}
+ el.textContent=(s.status||'-')+' · 已探测 '+s.done+' 个模型 · '+s.elapsed+'s';
+ if(s.report){DREP=s.report;paintDiscover();
+  document.getElementById('d_note').textContent='探测完成 · 可用 '+
+   DREP.reduce((a,p)=>a+(p.ok||0),0)+' / 共 '+DREP.reduce((a,p)=>a+(p.probed||0),0)}
+ if(s.running)setTimeout(pollDiscover,1000)}catch(e){el=document.getElementById('d_prog');
+  if(el)el.textContent='进度查询失败'}}
+function paintDiscover(){const rows=[];
+ DREP.forEach(p=>(p.models||[]).forEach(m=>rows.push({provider:m.provider,
+  model:m.model,ok:m.ok?'可用':'不可用',status:m.status,latency_ms:m.latency_ms,
+  context:m.context||'-',tokens:(m.usage||{}).total_tokens||0,
+  params:Object.keys(m.params||{}).filter(k=>m.params[k]==='supported').join(','),
+  rejected:Object.keys(m.params||{}).filter(k=>m.params[k]==='rejected').join(','),
+  err:(m.error||'').slice(0,80)})));
+ const t=document.getElementById('dres');
+ if(!rows.length){t.innerHTML='<tr><td class=empty colspan=10>还没有探测结果</td></tr>';return}
+ const hd=['提供方','模型','状态','HTTP','延迟ms','上下文','测试词元','支持参数','不支持参数','错误'];
+ t.innerHTML='<tr>'+hd.map(x=>'<th>'+x+'</th>').join('')+'</tr>'+rows.map(r=>
+  '<tr><td>'+esc(r.provider)+'</td><td><b>'+esc(r.model)+'</b></td><td>'+esc(r.ok)+
+  '</td><td>'+r.status+'</td><td>'+r.latency_ms+'</td><td>'+esc(r.context)+'</td><td>'+
+  r.tokens+'</td><td>'+esc(r.params)+'</td><td>'+esc(r.rejected)+'</td><td>'+
+  esc(r.err)+'</td></tr>').join('')}
+async function applyDiscovered(){try{const d=await send('/admin/models/apply','POST',
+  {providers:[gv('d_prov')]});
+  document.getElementById('d_note').textContent='别名总数 '+
+   ((d.applied||{}).models||'?')+' · 新增 '+(d.added||[]).length+' · 跳过 '+(d.skipped||[]).length;
+  loadProvidersForProbe()}
+ catch(e){document.getElementById('d_note').textContent='写入失败 · '+e.message}}
+async function clearCatalog(){try{await send('/admin/models?provider='+
+  encodeURIComponent(gv('d_prov')||''),'DELETE');loadCatalog();
+  document.getElementById('d_note').textContent='缓存已清空'}catch(e){toast('清空失败 · '+e.message)}}
+async function loadCatalog(){try{const d=await j('/admin/models');
+ const el=document.getElementById('d_seen');
+ if(el)el.textContent=d.count+' 个模型缓存'+
+  (d.last_seen?' · 最近 '+new Date(d.last_seen*1000).toLocaleString():'');
+ if(d.count&&!DREP.length){const by={};
+  (d.data||[]).forEach(m=>{(by[m.provider]=by[m.provider]||[]).push(m)});
+  DREP=Object.keys(by).map(k=>({provider:k,models:by[k],probed:by[k].length,
+   ok:by[k].filter(x=>x.ok).length}));paintDiscover()}}catch(e){}}
+"""
+JS += """
+ (function(){let k='a';try{k=localStorage.getItem(SKIN_KEY)||'a'}catch(e){}setSkin(k);
  const h=(location.hash||'').replace('#','');let p=h;
  if(PAGES.indexOf(p)<0){try{p=localStorage.getItem(PKEY)||'overview'}catch(e){p='overview'}}
  go(p);loadSelf();refresh()})();
 """
+JS += """
+const NET_ON=__NET_ON__;
+const NET='/internal/net';
+let netOpen=false;
+function netHdr(){return Object.assign({'content-type':'application/json'},hdr())}
+function netRow(k,v){return '<div class=netrow><em>'+k+'</em><code>'+(v==null?'-':esc(v))+'</code></div>'}
+async function netGet(u){const r=await fetch(NET+u,{headers:netHdr()});
+ const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error((d.detail&&d.detail.message)||u);return d}
+async function netSend(u,m,b){const r=await fetch(NET+u,{method:m,headers:netHdr(),
+ body:JSON.stringify(b||{})});const d=await r.json().catch(()=>({}));
+ if(!r.ok)throw new Error((d.detail&&d.detail.message)||u+' -> '+r.status);return d}
+function netPanel(on){netOpen=on;
+ document.getElementById('net_mask').classList.toggle('on',on);
+ document.getElementById('net_panel').classList.toggle('on',on);
+ if(on)netRefresh()}
+async function netRefresh(){const box=document.getElementById('net_body');
+ try{const [s,sc]=await Promise.all([netGet('/state'),netGet('/scores')]);
+  box.innerHTML=netRow('模式',s.mode)+netRow('控制器',s.controller)+netRow('在线',s.alive)+
+   netRow('出口',((s.paths||[]).join(' '))||'direct')+netRow('打分',s.scores)+
+   netRow('上次探测',s.last_refresh)+netRow('错误',s.error||'')+
+   '<h2>出口打分</h2><table id=net_t></table>'
+  const rows=(sc.scores||[]).map(x=>'<tr><td>'+esc(x.provider)+'</td><td>'+esc(x.egress)+
+   '</td><td>'+(x.ok?'通':'败')+'</td><td>'+x.delay_ms+'</td><td>'+x.fail_ratio+'</td></tr>');
+  document.getElementById('net_t').innerHTML=rows.length?
+   ('<tr><th>提供方</th><th>出口</th><th>状态</th><th>ms</th><th>失败率</th></tr>'+rows.join(''))
+   :'<tr><td class=empty colspan=5>尚无数据，点探测</td></tr>';
+  document.getElementById('net_note').textContent=''
+ }catch(e){box.innerHTML='<div class=muted>不可用：'+esc(e.message)+'</div>'}}
+async function netProbe(){document.getElementById('net_note').textContent='探测中…';
+ try{const d=await netSend('/probes','POST',{});
+  document.getElementById('net_note').textContent='探测 '+d.probes+' 次';netRefresh()}
+ catch(e){document.getElementById('net_note').textContent=e.message}}
+async function netMode(m){try{await netSend('/mode','POST',{mode:m});netRefresh()}
+ catch(e){document.getElementById('net_note').textContent=e.message}}
+async function netSelect(){const g=document.getElementById('net_g').value.trim(),
+ n=document.getElementById('net_n').value.trim();if(!g||!n)return;
+ try{await netSend('/select','PUT',{group:g,node:n});netRefresh()}
+ catch(e){document.getElementById('net_note').textContent=e.message}}
+async function netFlush(){try{await netSend('/flush','POST',{dns:true});
+ document.getElementById('net_note').textContent='DNS 已刷新'}
+ catch(e){document.getElementById('net_note').textContent=e.message}}
+function netEgress(){const p=document.getElementById('net_p').value.trim();if(!p)return;
+ netGet('/egress/'+encodeURIComponent(p)).then(d=>{document.getElementById('net_note').textContent=
+  p+' -> '+d.pick}).catch(e=>{document.getElementById('net_note').textContent=e.message})}
+if(NET_ON){document.getElementById('net_glyph').classList.remove('off');
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&netOpen)netPanel(false)})}
+"""
 BODY = """
 <body class="skin-a">
 <header>
-<h1>llm-router 控制台</h1>
+<h1>SMSocket 控制台</h1>
 <div class="nav">
 <button class="navbtn" data-p="overview" onclick="go('overview')">概览</button>
 <button class="navbtn" data-p="usage" onclick="go('usage')">流量与费用</button>
 <button class="navbtn" data-p="providers" onclick="go('providers')">提供商与API</button>
+<button class="navbtn" data-p="socket" onclick="go('socket')">并发与批量</button>
+<button class="navbtn" data-p="discover" onclick="go('discover')">模型探测</button>
 <button class="navbtn" data-p="settings" onclick="go('settings')">总设置</button>
 </div>
 <div class="cred"><em>基础URL</em><code id="baseurl">-</code>
@@ -394,6 +619,9 @@ BODY += """
 <div class="card"><b id="cost">-</b><i>累计费用</i></div>
 <div class="card"><b id="slots">-</b><i>密钥槽位</i></div>
 <div class="card"><b id="models">-</b><i>可用模型</i></div>
+<div class="card"><b id="xactive">-</b><i>当前并发</i></div>
+<div class="card"><b id="xpeak">-</b><i>峰值并发</i></div>
+<div class="card"><b id="xcurrency">-</b><i>计费币种</i></div>
 </div>
 <h2>按模型统计</h2><table id="bymodel"></table>
 <h2>密钥池摘要</h2><table id="pool"></table>
@@ -448,6 +676,9 @@ BODY += """
 <option value="round_robin">round_robin</option><option value="weighted">weighted</option></select></label>
 <label>重试次数<input id="g_retry" type="number"></label>
 <label>冷却秒数<input id="g_cd" type="number"></label>
+<label>最大并发（0=不限）<input id="g_maxc" type="number" value="0"></label>
+<label>排队等待(秒)<input id="g_qw" type="number" value="30"></label>
+<label>单提供方并发<input id="g_ppc" type="number" value="0"></label>
 <label>计费币种<input id="g_cur"></label>
 <label class="wide">定价（别名=每百万prompt/每百万completion，每行一条，* 为默认）
 <textarea id="g_pricing" rows="4"></textarea></label>
@@ -455,6 +686,23 @@ BODY += """
 <button type="button" onclick="loadSettings()">重新读取</button>
 <span>配置文件：<code id="g_path">-</code></span></div>
 </form>
+<h2>计费货币与汇率</h2>
+<form id="bf" onsubmit="saveBilling();return false">
+<label>显示币种<select id="b_cur"></select></label>
+<label>汇率基准<select id="b_base"></select></label>
+<label>小数位<input id="b_prec" type="number" value="6"></label>
+<label>汇率源URL<input id="b_url" placeholder="https://...（留空=手工汇率）"></label>
+<label class="wide">汇率表（币种=每1基准的数量，每行一条）
+<textarea id="b_rates" rows="6" placeholder="USD=1"></textarea></label>
+<div class="btns wide"><button type="submit">保存计费设置</button>
+<button type="button" onclick="refreshRates()">拉取在线汇率</button>
+<button type="button" onclick="loadBilling()">重新读取</button>
+<span id="b_note"></span></div></form>
+<h2>换算试算</h2>
+<div class="btns">
+<input id="c_amt" type="number" value="1" size="6">
+<select id="c_from"></select><em>→</em><select id="c_to"></select>
+<button onclick="convertTry()">试算</button><b id="c_out">-</b></div>
 <h2>客户端接入信息</h2>
 <pre id="hint">-</pre>
 <div class="cards">
@@ -463,9 +711,75 @@ BODY += """
 </div>
 <h2>可用模型别名</h2><pre id="g_models">-</pre>
 </div>
+<div class="page" id="page-socket">
+<div class="cards">
+<div class="card"><b id="s_active">-</b><i>在途请求</i></div>
+<div class="card"><b id="s_queued">-</b><i>排队中</i></div>
+<div class="card"><b id="s_peak">-</b><i>历史峰值</i></div>
+<div class="card"><b id="s_total">-</b><i>累计请求</i></div>
+<div class="card"><b id="s_rej">-</b><i>拒绝(429)</i></div>
+<div class="card"><b id="s_rps">-</b><i>每秒请求</i></div>
+<div class="card"><b id="s_wait">-</b><i>平均排队ms</i></div>
+<div class="card"><b id="s_err">-</b><i>失败数</i></div>
+</div>
+<h2>并发闸门</h2>
+<div class="cred"><em>上限</em><code id="s_max">-</code><em>单提供方</em><code id="s_ppc">-</code>
+<em>排队等待</em><code id="s_qw">-</code><em>状态</em><code id="s_sat">-</code>
+<button onclick="loadSocket()">刷新</button>
+<button id="s_auto" onclick="toggleAuto()">自动刷新：关</button></div>
+<h2>按提供方并发</h2><table id="sprov"></table>
+<h2>并行批量发送</h2>
+<form id="bf2" onsubmit="runBatch();return false">
+<label>并发数<input id="q_conc" type="number" value="8"></label>
+<label>模式<select id="q_mode"><option value="sync">同步等待</option>
+<option value="async">异步作业（可轮询）</option></select></label>
+<label>失败即停<select id="q_ff"><option value="0">否</option><option value="1">是</option></select></label>
+<label class="wide">请求列表（每行一个提示词，或一行一个 JSON 对象）
+<textarea id="q_body" rows="5">你好
+介绍一下你自己</textarea></label>
+<div class="btns wide"><button type="submit">发送</button>
+<button type="button" onclick="pollJob()">轮询作业</button>
+<span id="q_note"></span></div></form>
+<h2>批量结果</h2><table id="qres"></table>
+<h2>作业列表</h2><table id="qjobs"></table>
+</div>
+<div class="page" id="page-discover">
+<h2>探测提供商（发送测试消息获取真实模型与参数）</h2>
+<form id="df" onsubmit="startDiscover();return false">
+<label>目标<select id="d_prov"></select></label>
+<label>并发数<input id="d_conc" type="number" value="8"></label>
+<label>超时(秒)<input id="d_to" type="number" value="30"></label>
+<label>最多模型数<input id="d_max" type="number" value="200"></label>
+<label>测试提示词<input id="d_prompt" value="Reply with exactly one word: ok"></label>
+<label>指定模型（逗号分隔，留空=全部）<input id="d_models"></label>
+<label>探测参数<select id="d_params"><option value="1">是</option><option value="0">否</option></select></label>
+<label>探测流式<select id="d_stream"><option value="1">是</option><option value="0">否</option></select></label>
+<label>探测嵌入<select id="d_emb"><option value="0">否</option><option value="1">是</option></select></label>
+<div class="btns wide"><button type="submit">开始探测</button>
+<button type="button" onclick="pollDiscover()">刷新进度</button>
+<button type="button" onclick="applyDiscovered()">写入别名</button>
+<button type="button" onclick="clearCatalog()">清空缓存</button>
+<span id="d_note"></span></div></form>
+<div class="cred"><em>进度</em><code id="d_prog">未开始</code><em>缓存</em><code id="d_seen">-</code></div>
+<h2>探测结果（模型 · 可用性 · 参数）</h2><table id="dres"></table>
+</div>
 </main>
+<div class="netglyph off" id="net_glyph" title="net plane" onclick="netPanel(true)">⌁ net</div>
+<div class="netmask" id="net_mask" onclick="netPanel(false)"></div>
+<div class="netpanel" id="net_panel">
+<h2>网络出口（内部）</h2>
+<div class="netrow"><button onclick="netRefresh()">状态</button>
+<button onclick="netProbe()">探测</button><button onclick="netMode('auto')">auto</button>
+<button onclick="netMode('direct')">direct</button><button onclick="netMode('proxy')">proxy</button>
+<button onclick="netFlush()">flush dns</button><span id="net_note" class="muted"></span></div>
+<div class="netrow"><em>分组</em><input id="net_g" placeholder="PROXY-GRP">
+<em>节点</em><input id="net_n" placeholder="node"><button onclick="netSelect()">固定</button></div>
+<div class="netrow"><em>预览出口</em><input id="net_p" placeholder="provider">
+<button onclick="netEgress()">查看</button></div>
+<div id="net_body" class="muted">点“状态”读取 /internal/net/state</div>
+</div>
 """
 PAGE = ("<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>llm-router 控制台</title><style>" + CSS + "</style></head>"
+        "<title>SMSocket 控制台</title><style>" + CSS + "</style></head>"
         + BODY + "<script>" + JS + "</script></body></html>")

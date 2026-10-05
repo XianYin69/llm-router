@@ -73,7 +73,14 @@ class Pool:
         return out
 
     def candidates(self, alias: str, strategy: str = "priority",
-                   embed: bool = False) -> list[KeySlot]:
+                   embed: bool = False, net=None) -> list[KeySlot]:
+        """Ranked key slots for one alias.
+
+        `net` (a clash.NetPlane) is optional: when the net plane scores in smart
+        mode it re-ranks the result by measured egress quality, so a provider
+        only reachable through a proxy outranks a dead direct route. Strategy
+        order stays the tie-break, so nothing moves unless the network speaks.
+        """
         now = time.time()
         live = [s for s in self.serving(alias, embed) if s.available(now)]
         if not live:
@@ -81,7 +88,7 @@ class Pool:
         if strategy == "round_robin":
             n = len(live)
             self._cursor = (self._cursor + 1) % max(n, 1)
-            return live[self._cursor:] + live[:self._cursor]
+            return self._rerank(live[self._cursor:] + live[:self._cursor], net)
         if strategy == "weighted":
             weights = [max(s.provider.weight, 1) for s in live]
             out, bag = [], list(live)
@@ -89,9 +96,17 @@ class Pool:
                 pick = random.choices(bag, weights=[max(s.provider.weight, 1) for s in bag], k=1)[0]
                 out.append(pick)
                 bag.remove(pick)
-            return out
+            return self._rerank(out, net)
         # priority: high priority first, then low failure count, then weight
-        return sorted(live, key=lambda s: (-s.provider.priority, s.fails, -s.provider.weight))
+        return self._rerank(sorted(live, key=lambda s: (-s.provider.priority,
+                                                 s.fails, -s.provider.weight)), net)
+
+    @staticmethod
+    def _rerank(slots: list[KeySlot], net) -> list[KeySlot]:
+        """Stable sort by egress quality: fastest first, then least broken."""
+        if net is None or not getattr(net, "smart", False):
+            return slots
+        return sorted(slots, key=lambda s: net.sort_key(s.provider.name))
 
     def rebase(self, providers) -> "Pool":
         # Rebuild slots for a new provider set but carry over observed health,

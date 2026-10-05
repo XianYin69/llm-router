@@ -5,8 +5,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from llm_router.config import ProviderSpec, Settings, _env, load_config
-from llm_router.gateway import create_app
+from SMSocket.config import ProviderSpec, Settings, _env, load_config
+from SMSocket.gateway import create_app
 
 CALLS: list[str] = []
 
@@ -169,7 +169,7 @@ def test_stats_and_dashboard(client):
     s = client.get("/stats").json()
     assert s["calls"] >= 1 and s["tokens"] >= 7
     assert any(p["provider"] for p in s["by_provider"])
-    assert "llm-router" in client.get("/").text
+    assert "SMSocket" in client.get("/").text
 
 
 def test_reload_and_env_expansion(tmp_path, monkeypatch):
@@ -238,7 +238,7 @@ def test_reload_guard_and_key_health(client, tmp_path, monkeypatch):
     # 1. no config file on disk -> reload refused, live state untouched
     #    pin the path explicitly: a real config.yaml in the repo cwd must not
     #    make this assertion depend on where pytest was launched from
-    monkeypatch.setenv("LLMROUTER_CONFIG", str(tmp_path / "absent.yaml"))
+    monkeypatch.setenv("SMSSOCKET_CONFIG", str(tmp_path / "absent.yaml"))
     assert client.post("/admin/reload", headers=H).status_code == 409
     mid = [x for x in client.get("/pool").json()["slots"] if x["provider"] == "primary"]
     assert [x["fails"] for x in mid] == [x["fails"] for x in before], mid
@@ -250,7 +250,7 @@ def test_reload_guard_and_key_health(client, tmp_path, monkeypatch):
         "  - name: primary\n    base_url: http://mock/v1\n"
         "    keys:\n      - bad-key\n      - good-key-AAA\n"
         "    models:\n      demo: demo-upstream\n", encoding="utf-8")
-    monkeypatch.setenv("LLMROUTER_CONFIG", str(cfg))
+    monkeypatch.setenv("SMSSOCKET_CONFIG", str(cfg))
     r = client.post("/admin/reload", headers=H)
     assert r.status_code == 200, r.text
     assert r.json()["providers"] == 1
