@@ -467,6 +467,19 @@ def test_discover_paths_registers_nodes_of_tracked_groups_only():
     asyncio.run(run())
 
 
+def test_sustained_failure_over_fail_ratio_makes_a_path_unhealthy():
+    net = plane_for(cfg(fail_ratio=0.5))
+    net._record("openai", proxy_id(PROXY), ok=True, ms=10)
+    for _ in range(3):
+        net._record("openai", proxy_id(PROXY), ok=False, ms=2000, error="timeout")
+    sc = net.scores[("openai", proxy_id(PROXY))]
+    assert sc.fail_ratio == 0.75 and sc.ok is False   # 3 consecutive of 4 probes
+    assert net.pick("openai") == DIRECT               # a sick path gets no traffic
+    net._record("openai", proxy_id(PROXY), ok=True, ms=12)
+    assert sc.ok is True and sc.fail_ratio == 0.0     # recovery is immediate
+    asyncio.run(net.registry.aclose())
+
+
 def test_state_snapshot_describes_the_plane():
     net = plane_for(cfg())
     st = net.state()

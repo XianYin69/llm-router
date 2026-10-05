@@ -424,6 +424,11 @@ class NetPlane:
         sc.consecutive_fail = 0 if ok else sc.consecutive_fail + 1
         fails = sc.consecutive_fail if not ok else 0
         sc.fail_ratio = round(min(1.0, fails / max(sc.probes, 1)), 3)
+        # Sustained failure over the configured ratio makes a path unhealthy
+        # even when the newest probe looked fine; one success clears it again,
+        # so a recovered proxy can serve traffic without waiting for a reprobe.
+        if sc.fail_ratio > float(self.cfg.fail_ratio or 1.0):
+            sc.ok = False
         if not ok and error:
             sc.error = error[:MAX_BODY]
         self.scores[key] = sc
