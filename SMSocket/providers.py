@@ -69,6 +69,18 @@ class Pool:
         self.slots: list[KeySlot] = [
             KeySlot(p, k) for p in providers for k in p.keys]
         self._cursor = 0
+        # autotune overrides: provider name -> {"priority":int,"weight":int}
+        # empty = trust the numbers in the config file
+        self.derived: dict[str, dict] = {}
+
+    def set_derived(self, mapping: dict) -> None:
+        """Replace the whole derived table (autotune writes, nothing else does)."""
+        self.derived = {str(k): dict(v) for k, v in (mapping or {}).items()}
+
+    def eff(self, p) -> tuple:
+        """(priority, weight) actually in force: measured value, else typed value."""
+        d = self.derived.get(getattr(p, "name", "")) or {}
+        return (int(d.get("priority", p.priority)), int(d.get("weight", p.weight)))
 
     def upstream_model(self, slot: KeySlot, alias: str, embed: bool = False) -> str:
         table = slot.provider.embeddings if embed else slot.provider.models
@@ -102,16 +114,18 @@ class Pool:
             self._cursor = (self._cursor + 1) % max(n, 1)
             return self._rerank(live[self._cursor:] + live[:self._cursor], net)
         if strategy == "weighted":
-            weights = [max(s.provider.weight, 1) for s in live]
+            weights = [max(self.eff(s.provider)[1], 1) for s in live]
             out, bag = [], list(live)
             while bag:
-                pick = random.choices(bag, weights=[max(s.provider.weight, 1) for s in bag], k=1)[0]
+                pick = random.choices(bag, weights=[max(self.eff(s.provider)[1], 1)
+                                                    for s in bag], k=1)[0]
                 out.append(pick)
                 bag.remove(pick)
             return self._rerank(out, net)
         # priority: high priority first, then low failure count, then weight
-        return self._rerank(sorted(live, key=lambda s: (-s.provider.priority,
-                                                 s.fails, -s.provider.weight)), net)
+        # (measured values from autotune win over the numbers in the file)
+        return self._rerank(sorted(live, key=lambda s: (-self.eff(s.provider)[0],
+                                                 s.fails, -self.eff(s.provider)[1])), net)
 
     @staticmethod
     def _rerank(slots: list[KeySlot], net) -> list[KeySlot]:
@@ -129,9 +143,15 @@ class Pool:
             old = keep.get((x.provider.name, x.key))
             if old:
                 x.fails, x.dead_until, x.ok = old.fails, old.dead_until, old.ok
+        fresh.derived = dict(self.derived)   # measured ranking survives a reload
         return fresh
     def stats(self) -> list[dict]:
-        return [{"provider": s.provider.name, "key": mask(s.key), "ok": s.ok,
-                 "fails": s.fails,
-                 "cooldown_left": round(max(0.0, s.dead_until - time.time()), 1)}
-                for s in self.slots]
+        out = []
+        for s in self.slots:
+            pr, wt = self.eff(s.provider)
+            out.append({"provider": s.provider.name, "key": mask(s.key), "ok": s.ok,
+                        "fails": s.fails,
+                        "cooldown_left": round(max(0.0, s.dead_until - time.time()), 1),
+                        "priority": pr, "weight": wt,
+                        "auto": bool(self.derived.get(s.provider.name))})
+        return out

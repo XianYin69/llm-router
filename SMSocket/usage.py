@@ -11,7 +11,11 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS calls(
   status INTEGER, ms REAL, prompt INTEGER, completion INTEGER,
   total INTEGER, stream INTEGER, error TEXT, cost REAL DEFAULT 0,
   cost_currency TEXT DEFAULT "", cost_display REAL DEFAULT 0,
-  display_currency TEXT DEFAULT "", egress TEXT DEFAULT "")"""
+  display_currency TEXT DEFAULT "", egress TEXT DEFAULT "",
+  sid TEXT DEFAULT "", cid TEXT DEFAULT "", lane TEXT DEFAULT "",
+  skill TEXT DEFAULT "", "in" INTEGER DEFAULT 0,
+  "out_reason" INTEGER DEFAULT 0, "out_answer" INTEGER DEFAULT 0,
+  cache_read INTEGER DEFAULT 0, cache_write INTEGER DEFAULT 0)"""
 
 ASSESS_SCHEMA = """CREATE TABLE IF NOT EXISTS assess(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +70,19 @@ class Usage:
                            ("egress", "TEXT DEFAULT ''")):
             if name not in cols:      # migrate v0.2 databases in place
                 self.con.execute(f"ALTER TABLE calls ADD COLUMN {name} {decl}")
+        # v0.6 DSM: three-way accounting + attribution columns (contract §6 F).
+        # `in` is a SQLite reserved word, so every DSM column is quoted here and
+        # in log() - an unquoted INSERT fails at runtime, not at import.
+        for name, decl in (("sid", "TEXT DEFAULT ''"), ("cid", "TEXT DEFAULT ''"),
+                           ("lane", "TEXT DEFAULT ''"), ("skill", "TEXT DEFAULT ''"),
+                           ('"in"', "INTEGER DEFAULT 0"),
+                           ('"out_reason"', "INTEGER DEFAULT 0"),
+                           ('"out_answer"', "INTEGER DEFAULT 0"),
+                           ("cache_read", "INTEGER DEFAULT 0"),
+                           ("cache_write", "INTEGER DEFAULT 0")):
+            bare = name.strip('"')
+            if bare not in cols:      # migrate v0.5 databases in place
+                self.con.execute(f"ALTER TABLE calls ADD COLUMN {name} {decl}")
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts)")
         self.con.execute(ASSESS_SCHEMA)          # v0.4: model/net assessment rows
         self.con.execute("CREATE INDEX IF NOT EXISTS idx_assess_ts ON assess(ts)")
@@ -76,9 +93,11 @@ class Usage:
                "key": "", "status": 0, "ms": 0.0, "prompt": 0, "completion": 0,
                "total": 0, "stream": 0, "error": "", "cost": 0.0,
                "cost_currency": "", "cost_display": 0.0, "display_currency": "",
-               "egress": ""}
+               "egress": "", "sid": "", "cid": "", "lane": "", "skill": "",
+               "in": 0, "out_reason": 0, "out_answer": 0,
+               "cache_read": 0, "cache_write": 0}
         row.update(kw)
-        cols = ",".join(row)
+        cols = ",".join('"%s"' % k for k in row)
         ph = ",".join("?" * len(row))
         with self._lock:
             self.con.execute(f"INSERT INTO calls({cols}) VALUES({ph})", list(row.values()))
@@ -114,6 +133,33 @@ class Usage:
              "round(sum(cost_display),8) display FROM calls GROUP BY currency "
              "ORDER BY display DESC")
         return [dict(r) for r in self.con.execute(q)]
+
+    def by_lane(self, days: int = 14) -> list[dict]:
+        """Spend attributed to a DSM lane/skill - answers "which task row spent this?".
+
+        Rows logged before DSM (or by a legacy client) carry empty lane/skill, so they
+        surface as one `""` bucket instead of being dropped from the totals.
+        """
+        q = ("SELECT lane, skill, cid, count(*) calls, sum(total) tokens, "
+             'sum("in") tok_in, sum("out_reason") tok_reason, sum("out_answer") tok_answer, '
+             "sum(cache_read) tok_cache, round(sum(cost),8) cost, "
+             "round(sum(cost_display),8) display FROM calls "
+             "WHERE ts >= ? GROUP BY lane, skill, cid ORDER BY display DESC")
+        return [dict(r) for r in self.con.execute(q, (time.time() - 86400.0 * days,))]
+
+    def dsm_summary(self) -> dict:
+        """Three-way totals + cache hit evidence (the measurement step §8 demands)."""
+        r = self.con.execute(
+            'SELECT count(*) calls, sum(total) tokens, sum(prompt) tok_in, '
+            'sum(completion) tok_out, '
+            'sum("out_reason") tok_reason, sum("out_answer") tok_answer, '
+            'sum(cache_read) tok_cache, sum(cache_write) tok_cache_write, '
+            'sum(CASE WHEN cache_read > 0 THEN 1 ELSE 0 END) cache_hits, '
+            'sum(CASE WHEN sid != "" THEN 1 ELSE 0 END) dsm_calls, '
+            'round(sum(cost),8) cost FROM calls').fetchone()
+        d = dict(r)
+        d["cache_hit_rate"] = round((d.get("cache_hits") or 0) / max(1, d.get("calls") or 0), 4)
+        return d
 
     # ---- assessment log (v0.4) ---------------------------------------------
     ASSESS_COLS = ("ts", "model", "provider", "egress", "source", "ok", "status",

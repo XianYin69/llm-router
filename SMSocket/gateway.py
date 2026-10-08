@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,7 +14,12 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import upstream as up
+from . import dsm
+from . import egc
+from .autotune import AutoTuner
 from .batch import BatchRunner, BatchTooLarge
+from .billing import DEFAULT_RATES, SYMBOLS
 from .clash import ClashController, EgressRegistry, NetPlane
 from .net_routes import build as build_net
 from .assess import Assessor
@@ -21,12 +29,25 @@ from .config import Settings, envv, load_config
 from .discover import Catalog
 from .admin import build as build_admin
 from .dashboard import PAGE
+from .extensions import build as build_extensions
+from .dsm_routes import build as build_dsm
 from .providers import Pool
 from .stacksched import StackScheduler
 from .router import NoUpstream, Router, UpstreamError
 from .usage import Usage
 
 log = logging.getLogger("smssocket")
+
+CONSOLE_COOKIE = "sms_console"
+CONSOLE_TTL = 12 * 3600          # a console session is remembered for half a day
+RESPONSE_STORE_MAX = 200         # GET /v1/responses/{id} can read back this many
+LOOPBACK = {"127.0.0.1", "::1", "localhost", "testserver", "testclient"}
+
+
+def _loopback(request) -> bool:
+    """True for a browser on this machine (and TestClient in the tests)."""
+    host = (request.client.host if getattr(request, "client", None) else "") or ""
+    return host in LOOPBACK or host.startswith("127.")
 
 
 class State:
@@ -49,10 +70,18 @@ class State:
         self.net: NetPlane | None = None
         # model/net assessment - None while `assess.enabled` is false
         self.assessor: Assessor | None = None
+        # background model-probe loop (v0.5b): keeps the catalog fresh on its own
+        self.probe_task = None
         # stack scheduler - None while `stack.enabled` is false (plain 429s).
         # The `gate` setter above already built and attached it; a bare
         # annotation keeps the type visible without clobbering that attachment.
         self.stack: StackScheduler | None
+        # autotune - None while `tune.enabled` is false
+        self.tuner: AutoTuner | None = None
+        # console sessions minted for a browser on this machine (token -> expiry)
+        self.console: dict[str, float] = {}
+        # GET /v1/responses/{id} reads back from here (bounded, FIFO)
+        self.responses_store: dict[str, dict] = {}
 
     def build_stack(self) -> None:
         """(Re)create the parking lot and hand it to the gate.
@@ -128,6 +157,42 @@ class State:
         if self.router is not None:
             self.router.assessor = self.assessor
 
+    def build_tuner(self) -> None:
+        """(Re)create the weight/priority tuner from the measured window.
+
+        Cancel-first: apply_state() runs inside a live loop, so a naive start
+        would leave the previous scheduler task running and two tuners would
+        fight over the same pool.
+        """
+        old = getattr(self, "tuner", None)
+        if old is not None and old._task is not None:
+            old._task.cancel()
+        cfg = self.settings.tune
+        self.tuner = AutoTuner(self.settings, self.usage, self.pool) \
+            if (cfg.enabled and self.router is not None) else None
+        if self.router is not None:
+            self.router.tuner = self.tuner
+        if self.assessor is not None:
+            self.assessor.tuner = self.tuner
+        if self.tuner is not None:
+            self.tuner.start()          # no-op when no loop is running
+
+    def rewire(self) -> None:
+        """Re-point every dependent object at the current settings + pool.
+
+        A settings swap that only rebuilds the Router silently loses the net
+        plane (v0.3 regression) and leaves the assessor/tuner holding the old
+        Settings object, so they keep measuring against stale configuration.
+        """
+        for obj in (self.assessor, getattr(self, "tuner", None)):
+            if obj is not None and getattr(obj, "_task", None) is not None:
+                obj._task.cancel()
+        self.attach_router()
+        self.build_assessor()
+        if self.assessor is not None:
+            self.assessor.start()
+        self.build_tuner()
+
 
 async def rebuild_net_plane(st: State) -> None:
     """Stop the old plane (task + proxy clients), build a fresh one, restart."""
@@ -140,8 +205,35 @@ async def rebuild_net_plane(st: State) -> None:
                  len(st.net.registry.paths()))
 
 
+def bind_dsm(st: "State") -> dict:
+    """Point the DSM stores at this settings' paths/tiers (create_app + every reload).
+
+    The stores are module-level singletons so a hot reload swaps file targets without
+    orphaning in-flight requests; state() then answers "is DSM on?" from /healthz.
+    """
+    d = st.settings.dsm
+    base = Path(st.settings.db_path).parent
+    dsm.bind_settings(d)
+    return dsm.configure(schema_path=d.abs_path(base),
+                        session_path=d.abs_path(base, "dsm_sessions.json"),
+                        budget_map=d.budget_map)
+
+
+def bind_egc(st: "State") -> dict:
+    """Point the EGC outbound-standard layer at this settings' profile.
+
+    Same hot-reload discipline as bind_dsm: the profile is module-level and is
+    swapped in place, so an in-flight request keeps the profile it was built
+    with. `egc.enabled: false` returns egress to byte-for-byte legacy shape.
+    """
+    egc.bind_settings(st.settings.egc)
+    return egc.state()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     st = State(settings or load_config(envv("SMSSOCKET_CONFIG", "config.yaml")))
+    bind_dsm(st)
+    bind_egc(st)
     logging.basicConfig(level=getattr(logging, st.settings.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -159,6 +251,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         st.build_stack()
         if st.stack is not None:
             st.stack.start()
+        st.build_tuner()                 # measured weight/priority, if enabled
+        from .discover_routes import _probe_loop
+        if st.probe_task is None or st.probe_task.done():
+            st.probe_task = _probe_loop(st)
         log.info("SMSocket ready: %d providers, %d keys, %d models",
                  len(st.settings.providers), len(st.pool.slots), len(st.settings.model_index()))
         yield
@@ -168,6 +264,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await st.stack.stop()
         if st.assessor is not None:
             await st.assessor.stop()
+        if st.tuner is not None:
+            await st.tuner.stop()
+        if st.probe_task is not None:
+            st.probe_task.cancel()
+            st.probe_task = None
         await st.http.aclose()
         st.usage.close()
         st.catalog.close()
@@ -189,6 +290,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
         token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
         token = token or request.query_params.get("api_key", "")
+        if token in keys:
+            return
+        # a browser on this machine gets a cookie when it opens the console,
+        # so the operator never retypes the key; remote callers still need it
+        now = time.time()
+        for tok in [k for k, v in st.console.items() if v < now]:
+            st.console.pop(tok, None)
+        if request.cookies.get(CONSOLE_COOKIE, "") in st.console:
+            return
         if token not in keys:
             raise HTTPException(401, detail={"error": {"message": "invalid api key",
                                                        "type": "authentication_error"}})
@@ -207,7 +317,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz():
         return {"ok": True, "providers": len(st.settings.providers),
                 "keys": len(st.pool.slots), "models": len(st.settings.model_index()),
-                "active": st.meter.active, "currency": st.settings.billing.currency}
+                "active": st.meter.active, "currency": st.settings.billing.currency,
+                "dsm": dsm.state(), "egc": egc.state()}
 
     # ---- parallel batch + async jobs --------------------------------------
     @app.post("/v1/batch", dependencies=dep)
@@ -316,8 +427,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   "owned_by": ",".join(sorted({p.name for p in eidx[a]}))} for a in sorted(eidx)]
         return {"object": "list", "data": data}
 
+    def legacy_closed() -> None:
+        """dsm.openai_compat=false -> legacy endpoints answer 410 with the fix hint.
+
+        A loud refusal, never a silent downgrade: FF is already refused at config
+        load, so reaching here means the caller turned compat off on purpose.
+        """
+        if st.settings.dsm.openai_compat:
+            return
+        raise HTTPException(410, detail={"error": {
+            "message": "legacy OpenAI endpoints are closed (dsm.openai_compat=false); "
+                       "post a DSM envelope to /v1/dsm/chat or set dsm.openai_compat: true",
+            "type": "legacy_disabled", "code": "dsm_openai_compat_false"}})
+
     @app.post("/v1/chat/completions", dependencies=dep)
     async def chat(request: Request):
+        legacy_closed()
         payload = await request.json()
         alias = str(payload.get("model") or "")
         if not alias:
@@ -342,6 +467,71 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except UpstreamError as e:
             raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
                                                             "type": "upstream_error"}})
+
+    # ---- OpenAI Responses API (the second OpenAI surface) -----------------
+    # /v1/chat/completions and /v1/responses are different shapes, not aliases:
+    # input+instructions+max_output_tokens in, an output item list + status out,
+    # and a named-event SSE stream instead of chat.completion.chunk. The gateway
+    # serves both and translates against whatever the upstream actually speaks.
+    @app.post("/v1/responses", dependencies=dep)
+    async def responses(request: Request):
+        legacy_closed()
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(400, detail={"error": {
+                "message": "body must be an object", "type": "invalid_request_error"}})
+        payload = up.responses_to_chat_request(body)
+        alias = str(payload.get("model") or "")
+        if not alias:
+            raise HTTPException(400, detail={"error": {
+                "message": "model is required", "type": "invalid_request_error"}})
+        if alias not in st.settings.model_index():
+            raise HTTPException(404, detail={"error": {
+                "message": f"unknown model '{alias}'",
+                "type": "invalid_request_error"}})
+        out: dict = {}
+        try:
+            if payload.get("stream"):
+                slot, alias, t0, resp = await st.router.open_stream(payload)
+                hdr = {"x-socket-upstream": slot.provider.name,
+                       "x-router-upstream": slot.provider.name,
+                       **egress_headers(getattr(resp, "_sms_egress", ""))}
+                # wrap_stream normalises *any* upstream style into chat chunks,
+                # so one translation covers every provider style
+                chat_sse = st.router.wrap_stream(slot, alias, t0, resp)
+                return StreamingResponse(up.chat_stream_to_response_events(chat_sse, alias),
+                                         media_type="text/event-stream", headers=hdr)
+            chat = await st.router.complete(payload, egress_out=out)
+            obj = up.chat_to_responses_obj(chat, alias)
+            store = st.responses_store
+            while len(store) >= RESPONSE_STORE_MAX:
+                store.pop(next(iter(store)), None)
+            store[obj["id"]] = obj
+            return JSONResponse(obj, headers=egress_headers(out.get("egress", "")))
+        except NoUpstream as e:
+            raise HTTPException(503, detail={"error": {"message": str(e),
+                                                       "type": "server_error"}})
+        except UpstreamError as e:
+            raise HTTPException(e.status, detail={"error": {"message": str(e.detail),
+                                                            "type": "upstream_error"}})
+
+    @app.get("/v1/responses/{response_id}", dependencies=dep)
+    async def responses_get(response_id: str):
+        obj = st.responses_store.get(response_id)
+        if obj is None:
+            raise HTTPException(404, detail={"error": {
+                "message": f"unknown response '{response_id}'",
+                "type": "invalid_request_error"}})
+        return JSONResponse(obj)
+
+    @app.delete("/v1/responses/{response_id}", dependencies=dep)
+    async def responses_delete(response_id: str):
+        gone = st.responses_store.pop(response_id, None)
+        if gone is None:
+            raise HTTPException(404, detail={"error": {
+                "message": f"unknown response '{response_id}'",
+                "type": "invalid_request_error"}})
+        return {"id": response_id, "object": "response", "deleted": True}
 
     @app.get("/stack")
     async def stack_state(entries: int = 20):
@@ -451,13 +641,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "cooldown": st.settings.cooldown, "slots": st.pool.stats()}
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard():
+    async def dashboard(request: Request):
         # __NET_ON__ drives the discreet footer glyph: 0 -> the panel is absent
         # from the DOM entirely, so a disabled net plane leaves no trace.
         # __ASSESS_ON__ does the same for the reachability block: a gateway that
         # measures nothing must not advertise a measuring tool.
-        return (PAGE.replace("__NET_ON__", "1" if st.settings.clash.enabled else "0")
-                .replace("__ASSESS_ON__", "1" if st.settings.assess.enabled else "0"))
+        # __SKIN__ is the *server-side* theme (config `ui.skin`): a theme chosen
+        # in one browser survives a new profile, a private window or a reinstall.
+        # __CUR__/__SYM__ render the currency list into the page so the billing
+        # selects are never empty, even before the first authenticated call.
+        b = st.settings.billing
+        currencies = sorted(set(b.rates) | set(DEFAULT_RATES))
+        html = (PAGE.replace("__NET_ON__", "1" if st.settings.clash.enabled else "0")
+                .replace("__ASSESS_ON__", "1" if st.settings.assess.enabled else "0")
+                .replace("__SKIN__", st.settings.ui.skin)
+                .replace("__CUR__", json.dumps(currencies))
+                .replace("__SYM__", json.dumps(SYMBOLS, ensure_ascii=False)))
+        resp = HTMLResponse(html)
+        tok = request.cookies.get(CONSOLE_COOKIE, "")
+        if tok in st.console and st.console[tok] > time.time():
+            return resp
+        if _loopback(request):
+            tok = secrets.token_urlsafe(32)
+            st.console[tok] = time.time() + CONSOLE_TTL
+            resp.set_cookie(CONSOLE_COOKIE, tok, max_age=CONSOLE_TTL,
+                            httponly=True, samesite="strict", path="/")
+        return resp
 
     @app.post("/admin/reload", dependencies=dep)
     async def reload_config():
@@ -490,15 +699,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         st.build_assessor()                    # after the router exists again
         if st.assessor is not None:
             st.assessor.start()
+        st.build_tuner()                       # cancel-first, then start
+        bind_dsm(st)                           # dsm: block may have moved paths/tiers
+        bind_egc(st)                           # egc: profile / lane whitelist may have moved
         log.info("reloaded: %d providers, %d keys", len(new.providers), len(st.pool.slots))
         return {"ok": True, "providers": len(new.providers), "keys": len(st.pool.slots),
-                "net_plane": bool(st.net is not None),
+                "net_plane": bool(st.net is not None), "dsm": dsm.state(),
+                "egc": egc.state(),
                 "stack": bool(st.stack is not None), "parked_dropped": parked,
                 "assess": bool(st.assessor is not None)}
 
+    # ---- measured weight / priority --------------------------------------
+    @app.get("/tune", dependencies=dep)
+    async def tune_state():
+        """What the gateway currently believes about each provider, and why."""
+        t = getattr(st, "tuner", None)
+        if t is None:
+            return {"enabled": False, "scores": [], "in_force": {},
+                    "config": st.settings.tune.as_config(),
+                    "note": "tuning is disabled (set tune.enabled: true)"}
+        return t.status()
+
+    @app.post("/tune/apply", dependencies=dep)
+    async def tune_apply():
+        """Re-rank right now from the measured window (no timer wait)."""
+        t = getattr(st, "tuner", None)
+        if t is None:
+            raise HTTPException(409, detail={"error": {
+                "message": "tuning is disabled (set tune.enabled: true)",
+                "type": "tuning_disabled"}})
+        return t.apply()
+
     app.include_router(build_admin(st, dep))   # includes /admin/billing*
+    app.include_router(build_extensions(st, dep))   # 扩展程序：导入 · 识别码验证 · 自带面板
     # Discreet operator surface: not in /openapi.json, not in /docs, not in the nav.
     app.include_router(build_net(st, dep), prefix="/internal/net",
                        include_in_schema=False)
     app.include_router(build_assess(st, dep))
+    # DSM envelope endpoints: always mounted, gated per-request by dsm.enabled
+    # (404 when off = the exact signal the client uses to downgrade, contract §1)
+    app.include_router(build_dsm(st, dep, egress_headers))
     return app

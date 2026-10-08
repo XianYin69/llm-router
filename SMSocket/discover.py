@@ -319,9 +319,21 @@ class Catalog:
         return n
 
     def all(self, provider: str = "") -> list[dict]:
-        q = "SELECT data FROM models" + (" WHERE provider=?" if provider else "") + " ORDER BY provider,model"
+        """Cached rows, newest write time folded in as `ts`.
+
+        The row json comes from `ProbeResult.as_dict()`, which has no timestamp
+        of its own; the console needs one to decide what counts as stale, so the
+        column value is merged here rather than duplicated into every writer.
+        """
+        q = "SELECT data, ts FROM models" + (" WHERE provider=?" if provider else "") + \
+            " ORDER BY provider,model"
         cur = self.con.execute(q, (provider,) if provider else ())
-        return [json.loads(r["data"]) for r in cur.fetchall()]
+        out = []
+        for r in cur.fetchall():
+            d = json.loads(r["data"])
+            d.setdefault("ts", float(r["ts"] or 0.0))
+            out.append(d)
+        return out
 
     def last_seen(self) -> float:
         row = self.con.execute("SELECT max(ts) t FROM models").fetchone()

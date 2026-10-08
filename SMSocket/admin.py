@@ -12,6 +12,10 @@ Used by the "提供商与API" page (providers / custom APIs / keys) and the
   DELETE /admin/providers/{name}/keys/{idx} drop an api key
   GET    /admin/self?reveal=1              base_url + master key for client setup
   GET    /admin/export                     raw config text (secrets masked)
+  GET    /admin/extensions                 imported bundles + install code (masked)
+  POST   /admin/extensions/import|pair|remove   register / pair / unmount
+  GET    /admin/extensions/{name}/panel    the bundle's own panel (verified only)
+                                           (implementation: extensions.py)
 
 Safety: writes go to a temp file, are parsed by load_config() before swapping,
 the previous file is kept as <name>.bak, and live state is only re-based after
@@ -20,6 +24,7 @@ a successful parse. Secrets never leave the server unmasked except through
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -29,6 +34,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 
 from . import billing_routes, discover_routes
+from .discover_routes import auto_discover
 from .billing_routes import billing_map
 from .concurrency import Gate
 from .config import envv, load_config
@@ -41,6 +47,39 @@ GLOBALS = ("listen", "strategy", "retry", "cooldown", "db_path", "log_level",
            "currency", "max_concurrency", "queue_wait", "per_provider_concurrency")
 P_FIELDS = ("base_url", "style", "weight", "priority", "timeout", "max_rpm",
             "enabled", "models", "embeddings", "extra_headers")
+
+
+def queue_discover(st, names: list[str]) -> str:
+    """Fire the probe->publish->measure chain in the background.
+
+    Returns "queued" when a loop is live, "skipped" otherwise (a CLI run that
+    never serves a request has nothing to measure). Never raises: an operator
+    adding a provider must not get a failed POST because probing blew up.
+    """
+    cfg = getattr(st.settings, "discover", None)
+    if cfg is None or not getattr(cfg, "on_add", True):
+        return "off"
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return "no-loop"
+    asyncio.create_task(auto_discover(st, list(names)))
+    return "queued"
+
+
+async def rebuild_net(st) -> bool:
+    """Rebuild the egress plane after a `clash:` change (True = plane is live)."""
+    try:
+        if st.net is not None:
+            await st.net.stop()
+    except Exception:                                       # noqa: BLE001
+        pass
+    st.build_net_plane()
+    if st.net is not None:
+        st.net.start()
+    if hasattr(st, "rewire"):
+        st.rewire()
+    return bool(st.net is not None)
 
 
 def cfg_path() -> Path:
@@ -94,6 +133,7 @@ def prov_dict(p) -> dict:
             "max_rpm": p.max_rpm, "enabled": p.enabled,
             "models": dict(p.models), "embeddings": dict(p.embeddings),
             "extra_headers": dict(p.extra_headers),
+            "auto": bool(getattr(p, "auto", True)),
             "keys": [mask(k) for k in p.keys], "key_count": len(p.keys)}
 
 
@@ -122,9 +162,10 @@ def clean_provider(item: dict, old=None) -> dict:
         raise HTTPException(400, detail={"error": {"message": "base_url must start with http(s)",
                                                    "type": "invalid_request_error"}})
     style = str(item.get("style") or "openai").strip().lower()
-    if style not in ("openai", "anthropic"):
-        raise HTTPException(400, detail={"error": {"message": "style is openai or anthropic",
-                                                   "type": "invalid_request_error"}})
+    if style not in ("openai", "openai-responses", "anthropic"):
+        raise HTTPException(400, detail={"error": {
+            "message": "style is openai, openai-responses (Responses API) or anthropic",
+            "type": "invalid_request_error"}})
     prev = old or {}
     out = {"name": name, "base_url": base, "style": style,
            "keys": list(prev.get("keys") or []),
@@ -135,7 +176,9 @@ def clean_provider(item: dict, old=None) -> dict:
            "priority": int(item.get("priority", prev.get("priority", 0))),
            "timeout": float(item.get("timeout", prev.get("timeout", 120.0))),
            "max_rpm": int(item.get("max_rpm", prev.get("max_rpm", 0))),
-           "enabled": bool(item.get("enabled", prev.get("enabled", True)))}
+           "enabled": bool(item.get("enabled", prev.get("enabled", True))),
+           # auto: measured weight/priority may replace the typed ones
+           "auto": bool(item.get("auto", prev.get("auto", True)))}
     return {k: v for k, v in out.items() if v not in ({}, [], "")}
 
 
@@ -158,7 +201,13 @@ def apply_state(st) -> dict:
     st.pool = st.pool.rebase(new.providers) if st.pool else Pool(new.providers)
     st.gate = Gate(getattr(new, "max_concurrency", 0), getattr(new, "queue_wait", 30.0),
                    getattr(new, "per_provider_concurrency", 0), st.meter)
-    st.router = Router(st.settings, st.pool, st.usage, st.http, st.gate)
+    # a settings swap must re-point every dependent object, not just the router:
+    # the old code built a bare Router here, silently dropping the net plane and
+    # leaving the assessor/tuner holding the previous settings (v0.3 regression)
+    if hasattr(st, "rewire"):
+        st.rewire()
+    else:
+        st.router = Router(st.settings, st.pool, st.usage, st.http, st.gate)
     return {"providers": len(new.providers), "keys": len(st.pool.slots),
             "models": len(new.model_index())}
 
@@ -169,6 +218,93 @@ def find(provs: list, name: str) -> dict:
             return item
     raise HTTPException(404, detail={"error": {"message": f"unknown provider: {name}",
                                                "type": "invalid_request_error"}})
+
+
+CLASH_FIELDS = ("enabled", "controller", "secret", "mixed_port", "proxy_url",
+                "health_url", "timeout", "interval", "mode", "groups",
+                "provider_proxy", "smart", "min_delay_ms", "fail_ratio")
+CLASH_MODES = ("auto", "direct", "proxy")
+
+
+def clash_map(val, prev: dict | None = None) -> dict:
+    """UI payload -> config `clash:` block (validated by clash_from_raw)."""
+    from .config import clash_from_raw
+    if not isinstance(val, dict):
+        raise HTTPException(400, detail={"error": {"message": "clash must be an object",
+                                                   "type": "invalid_request_error"}})
+    prev = prev or {}
+    out: dict = {}
+    for k in ("enabled", "smart"):
+        if k in val:
+            out[k] = bool(val[k])
+    if "mode" in val:
+        mode = str(val.get("mode") or "auto").strip().lower()
+        if mode not in CLASH_MODES:
+            raise HTTPException(400, detail={"error": {
+                "message": f"clash.mode must be one of {CLASH_MODES}",
+                "type": "invalid_request_error"}})
+        out["mode"] = mode
+    for k in ("controller", "proxy_url", "health_url"):
+        if k in val:
+            u = str(val.get(k) or "").strip()
+            if u and not u.startswith("http"):
+                raise HTTPException(400, detail={"error": {
+                    "message": f"clash.{k} must start with http",
+                    "type": "invalid_request_error"}})
+            out[k] = u
+    if "secret" in val:
+        sec = str(val.get("secret") or "").strip()
+        # the UI never echoes the secret back: empty means "keep what is stored"
+        out["secret"] = sec or str(prev.get("secret") or "")
+    for k in ("mixed_port",):
+        if k in val:
+            out[k] = int(float(val.get(k) or 0))
+    for k in ("timeout", "interval", "min_delay_ms", "fail_ratio"):
+        if k in val and val.get(k) not in (None, ""):
+            out[k] = float(val[k])
+    if "groups" in val:
+        g = val.get("groups")
+        if isinstance(g, str):
+            g = [x.strip() for x in re.split(r"[,;\s]+", g) if x.strip()]
+        out["groups"] = [str(x).strip() for x in (g or []) if str(x).strip()]
+    if "provider_proxy" in val:
+        pp = val.get("provider_proxy")
+        if isinstance(pp, str):
+            text, pp = pp, {}
+            for line in lines_of(text):        # the text, not the dict we made
+                a = line.split("=")
+                if len(a) == 2 and a[0].strip() and a[1].strip():
+                    pp[a[0].strip()] = a[1].strip()
+        if not isinstance(pp, dict):
+            raise HTTPException(400, detail={"error": {
+                "message": "clash.provider_proxy must be a mapping",
+                "type": "invalid_request_error"}})
+        out["provider_proxy"] = {str(k).strip(): str(v).strip()
+                                 for k, v in pp.items()
+                                 if str(k).strip() and str(v).strip()}
+    try:
+        clash_from_raw({**prev, **out})
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": {"message": str(exc),
+                                                   "type": "invalid_request_error"}})
+    return out
+
+
+def lines_of(text: str) -> list[str]:
+    return [x.strip() for x in str(text or "").split("\n") if x.strip()]
+
+
+def ui_map(val) -> dict:
+    from .config import ui_from_raw
+    if not isinstance(val, dict):
+        raise HTTPException(400, detail={"error": {"message": "ui must be an object",
+                                                   "type": "invalid_request_error"}})
+    try:
+        cfg = ui_from_raw(val)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": {"message": str(exc),
+                                                   "type": "invalid_request_error"}})
+    return cfg.as_config()
 
 
 def pricing_map(val) -> dict:
@@ -199,6 +335,11 @@ def build(st, dep) -> APIRouter:
         return {"path": str(path), "exists": path.exists(),
                 **{k: getattr(s, k) for k in GLOBALS},
                 "billing": s.billing.as_config(),
+                "ui": s.ui.as_config(),
+                "clash": s.clash.as_config(),
+                "extensions": [e.as_config() for e in (s.extensions or [])],
+                "discover": s.discover.as_config(),
+                "tune": s.tune.as_config(),
                 "pricing": s.pricing,
                 "providers": [prov_dict(p) for p in s.providers],
                 "models": sorted(s.model_index()),
@@ -219,6 +360,18 @@ def build(st, dep) -> APIRouter:
                 "key_masked": mask(full), "key_file": str(key_path(cfg_path())),
                 "models": sorted(st.settings.model_index())}
 
+    @r.put("/admin/ui")
+    async def put_ui(request: Request):
+        """Remember the console theme in the config file (not just the browser)."""
+        body = await request.json()
+        block = ui_map(body)
+        path = cfg_path()
+        data = read_raw(path)
+        data["ui"] = {**(data.get("ui") or {}), **block}
+        write_raw(path, data)
+        st.settings.ui.skin = block["skin"]        # live immediately, no rebuild
+        return {"ok": True, "skin": block["skin"], "saved": True}
+
     @r.get("/admin/export")
     async def export_config():
         data = json.loads(json.dumps(read_raw(cfg_path()), default=str))
@@ -237,6 +390,7 @@ def build(st, dep) -> APIRouter:
                                                        "type": "invalid_request_error"}})
         path = cfg_path()
         data = read_raw(path)
+        clash_touched = False
         if body.get("strategy") not in (None, "priority", "round_robin", "weighted"):
             raise HTTPException(400, detail={"error": {"message": "bad strategy",
                                                        "type": "invalid_request_error"}})
@@ -257,6 +411,34 @@ def build(st, dep) -> APIRouter:
         elif "currency" in body:
             cur = data.get("billing") or {}
             data["billing"] = {**cur, "currency": str(body["currency"]).strip().upper()}
+        if "ui" in body:
+            data["ui"] = ui_map(body["ui"])
+        if "clash" in body:
+            cur = data.get("clash") or {}
+            if not isinstance(cur, dict):
+                cur = {}
+            data["clash"] = {**cur, **clash_map(body["clash"], cur)}
+            clash_touched = True
+        if "discover" in body:
+            from .config import discover_from_raw
+            cur = data.get("discover") or {}
+            merged = {**cur, **body["discover"]} if isinstance(cur, dict) else body["discover"]
+            try:
+                discover_from_raw(merged)
+            except ValueError as exc:
+                raise HTTPException(400, detail={"error": {
+                    "message": str(exc), "type": "invalid_request_error"}})
+            data["discover"] = merged
+        if "tune" in body:
+            from .config import tune_from_raw
+            cur = data.get("tune") or {}
+            merged = {**cur, **body["tune"]} if isinstance(cur, dict) else body["tune"]
+            try:
+                tune_from_raw(merged)
+            except ValueError as exc:
+                raise HTTPException(400, detail={"error": {
+                    "message": str(exc), "type": "invalid_request_error"}})
+            data["tune"] = merged
         if "pricing" in body:
             data["pricing"] = pricing_map(body["pricing"])
         if isinstance(body.get("providers"), list):
@@ -267,7 +449,10 @@ def build(st, dep) -> APIRouter:
             raise HTTPException(409, detail={"error": {"message": "refusing to drop all providers",
                                                        "type": "invalid_request_error"}})
         write_raw(path, data)
-        return {"ok": True, "applied": apply_state(st), "config": snapshot()}
+        applied = apply_state(st)
+        if clash_touched:
+            applied["net_plane"] = await rebuild_net(st)
+        return {"ok": True, "applied": applied, "config": snapshot()}
 
     r.include_router(billing_routes.build(st, dep))
     r.include_router(discover_routes.build(st, dep))
@@ -289,7 +474,10 @@ def build(st, dep) -> APIRouter:
         provs.append(item)
         data["providers"] = provs
         write_raw(path, data)
-        return {"ok": True, "applied": apply_state(st), "config": snapshot()}
+        applied = apply_state(st)
+        queued = queue_discover(st, [item["name"]])
+        return {"ok": True, "applied": applied, "config": snapshot(),
+                "auto_discover": queued}
 
     @r.patch("/admin/providers/{name}")
     async def patch_provider(name: str, request: Request):
@@ -310,7 +498,10 @@ def build(st, dep) -> APIRouter:
                 provs[i] = item
         data["providers"] = provs
         write_raw(path, data)
-        return {"ok": True, "applied": apply_state(st), "config": snapshot()}
+        applied = apply_state(st)
+        queued = queue_discover(st, [name])
+        return {"ok": True, "applied": applied, "config": snapshot(),
+                "auto_discover": queued}
 
     @r.delete("/admin/providers/{name}")
     async def del_provider(name: str):

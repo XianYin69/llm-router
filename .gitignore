@@ -13,3 +13,8 @@ Dockerfile.local
 router.key
 smsocket.key
 runtime/
+
+# 装机唯一识别码（扩展程序配对码·本机私有·与 smsocket.key 同级，不入库）
+smsocket.identity
+Users/
+*.bak

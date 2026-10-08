@@ -1,0 +1,42 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "dsm://sms/v1/envelope",
+ "title": "DSM v1 — Delta Session Mesh（SMS 内部报文信封）",
+ "description": "SMS 内部唯一报文形态。只带引用与策略，不带可重放内容；出网由 SMSocket 出口层物化为提供商指定格式（openai-chat / openai-responses / anthropic）。扩展位 x 内的未知键必须原样保留。",
+ "type": "object",
+ "required": ["v", "sch", "d"],
+ "additionalProperties": false,
+ "properties": {
+  "v": {"type": "integer", "const": 1, "description": "协议版本。协商用，替代 OpenAI 的 object 字段。"},
+  "sid": {"type": "string", "description": "SMS session id（= chains ACTIVE 的 sess）。会话态与并发 lane 的归属根。内部专用，不出网。"},
+  "cid": {"type": "string", "description": "conv id（= chains ACTIVE 的 conv）。链归属与费用归因的最小单位。内部专用。"},
+  "lane": {"type": "string", "description": "并发道号（任务表行 t1..tN / 子技能 conv）。注意：与工具参数 task.lane / task_plan.lane 同名，靠位置区分（顶层=协议面，parameters.properties=内容面）。内部专用。"},
+  "dep": {"type": "array", "items": {"type": "string"}, "description": "本 lane 的前置 lane 列表。未全部完成则 dispatchable=false，不得进批。内部专用。"},
+  "sch": {"type": "string", "pattern": "^sha1:[0-9a-f]{12}$", "description": "system+tools 规范化指纹（sort_keys 后 sha1 前 12 位）。出口按此从本机 SchemaStore 物化全文；指纹缺失=首帧登记请求。取代每轮重传 17760 字节。"},
+  "mem": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{10}$"}, "description": "链碎片 id 的有序引用表（append-only）。出口按 id 字典序物化为记忆块——顺序确定才有字节稳定前缀。12 链：user/memory/logic/time/event/session/skill_call/tool_call/subsession/dialogue/knowledge/error。"},
+  "d": {"type": "array", "description": "delta 轮次：只传新增。位置化 [role_id, text]，role_id 双射表 [0=system,1=user,2=assistant,3=tool,4=constraint,5,note]。", "items": {"type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{"type": "integer", "minimum": 0, "maximum": 5}, {"type": "string"}]}},
+  "cons": {"type": "object", "description": "任务约束槽位（把口径从自然语言里提出来）。出口按固定模板物化为约束行，模板本身锁死以保证可复现。", "properties": {"dedup_key": {"type": "array", "items": {"type": "string"}}, "fx": {"type": "object", "additionalProperties": {"type": "number"}}, "round": {"type": "string"}, "output": {"type": "string"}, "must": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true},
+  "budget": {"type": "object", "description": "思考预算分档。这是唯一能撬动 62-67% 输出侧成本的把手；max_tokens 一刀切不可用。", "properties": {"reason": {"enum": ["low", "mid", "high", "auto"]}, "max_out": {"type": "integer"}, "when_exceeded": {"enum": ["answer_partial", "truncate", "retry_higher", "fallback_lane"]}}, "additionalProperties": false},
+  "lat": {"type": "object", "description": "时延策略（网关消费，不出网）。实测 TTFT 与输出量正相关、与输入量几乎无关，故约束点是思考量与换路，不是报文大小。", "properties": {"ttft_ms": {"type": "integer"}, "total_ms": {"type": "integer"}, "on_exceed": {"enum": ["failover", "degrade", "abort"]}}, "additionalProperties": false},
+  "fan": {"type": "object", "description": "并发扇出声明。SMSocket 传出时按 lane 拆分成 /v1/batch 的 requests[]。", "properties": {"n": {"type": "integer", "minimum": 1, "maximum": 256}, "lane_ids": {"type": "array", "items": {"type": "string"}}, "per_lane": {"type": "object", "additionalProperties": {"type": "array"}}, "concurrency": {"type": "integer", "minimum": 1, "maximum": 256}, "merge": {"enum": ["concat", "vote", "reduce", "first_ok"]}, "fail_fast": {"type": "boolean"}}, "additionalProperties": false},
+  "out": {"enum": ["json", "delta", "msgpack"], "description": "期望响应编码。delta/msgpack 消解实测「每输出 token 背 63-83 字节 SSE 信封」。msgpack 本机未装，当前为协商位。"},
+  "bill": {"type": "object", "description": "费用归因（写进 usage 表新列，不出网）。现状 usage.sqlite3 无 conv/skill 列，成本无法归到技能或任务行。", "properties": {"to": {"type": "string"}, "row": {"type": "string"}, "ceiling": {"type": "number"}}, "additionalProperties": false},
+  "verify": {"type": "array", "description": "机检断言。SMS 收到响应后自校，不参与出网。", "items": {"type": "object", "properties": {"path": {"type": "string"}, "assert": {"type": "string"}}, "required": ["path", "assert"]}, "additionalProperties": false},
+  "x": {"type": "object", "description": "扩展命名空间。未知键必须原样保留并透传回内部；新增语义一律走 x.<域>.<名>；本表已列名＝核心保留位，未列名单字母一律不得新增。", "additionalProperties": true}
+ },
+ "$defs": {
+  "response": {
+   "description": "DSM 响应信封（网关→SMS）",
+   "type": "object",
+   "properties": {
+    "v": {"const": 1}, "sid": {"type": "string"}, "lane": {"type": "string"}, "seq": {"type": "integer"},
+    "reason": {"type": "object", "properties": {"tokens": {"type": "integer"}, "summary": {"type": "string"}}},
+    "answer": {},
+    "stop": {"enum": ["end_turn", "tool_call", "length", "budget_exceeded", "error"]},
+    "usage": {"type": "object", "description": "三分账 + 缓存账。现状 completion_tokens 把思考全额计入却不可分项，cache_read 根本没被提取。", "properties": {"in": {"type": "integer"}, "out_reason": {"type": "integer"}, "out_answer": {"type": "integer"}, "cache_read": {"type": "integer"}, "cache_write": {"type": "integer"}, "cost": {"type": "number"}, "currency": {"type": "string"}}},
+    "egress": {"type": "string", "description": "实际走的出口（= 现状 x-socket-egress 头）"},
+    "lanes": {"type": "array", "description": "fan 合并后的分道结果", "items": {"type": "object"}}
+   }
+  }
+ }
+}

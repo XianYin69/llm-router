@@ -47,6 +47,28 @@ pricing:                          # per 1M tokens; `currency:` per row = what th
   deepseek-chat: {prompt: 0.27, completion: 1.10, currency: CNY}
 log_level: INFO
 
+# ---- v0.6: DSM v1 envelope (additive layer, off by default) -------------------
+# enabled=false -> /v1/dsm/* answers 404 and nothing about /v1/chat/completions changes.
+# enabled=false AND openai_compat=false is refused at load (both roads closed = no gateway).
+dsm:
+  enabled: false                    # serve POST /v1/dsm/chat + /v1/dsm/schema + /v1/dsm/fan
+  openai_compat: true               # false -> legacy endpoints answer 410 (loud, never silent)
+  schema_store: runtime/dsm_schemas.json   # ref -> {system, tools}; session store sits beside it
+  max_materialize_bytes: 2000000    # materialised body above this -> 413
+  budget_map: {low: 1024, mid: 4096, high: 16384}   # server-side thinking tiers
+  require_registered_schema: false  # true -> refuse chat when sch was never registered
+
+egc:                                  # EGC v1 出站标准层（egc.py·规范_出站精简_EGC_v1.md）
+  # 位置：DSM 信封物化之后、序列化之前——出网的最后一道。默认档只开「实测零语义
+  # 损失」的开关；enabled: false 一行回到旧行为（出网字节与接它之前逐字节相同）。
+  enabled: true
+  budget_ms: 5                        # 毫秒门：转换 p95 必须 <= 它（实测 0.2~0.7ms）
+  validate: true                      # 出网前机检；不过则退回未精简 body（宁可不省也不发 400）
+  # ff: {R3a_drop_fn_desc: true}      # 有语义代价的开关，按 lane 显式打开
+  # lane_tools:                       # R4：按 lane 只带真用的工具（实测 17→6 省 37.5% token）
+  #   "*": [read, grep, exec]
+  #   conv: [read, write, chain]
+
 providers:
   - name: openai
     base_url: https://api.openai.com/v1
@@ -91,7 +113,8 @@ providers:
     enabled: false               # flip to true to activate
 
 # ---- v0.4 net plane (optional, OFF by default) ---------------------------
-# Route upstream calls through a clash external-controller: score every egress
+# Route upstream calls through an smsc/clash external-controller (UI label: SMSC,
+# under 总设置 → 扩展程序): score every egress
 # path (direct vs. proxy/node) and send each provider through the best one.
 # Operator surface is /internal/net/* - deliberately absent from OpenAPI/docs.
 clash:
@@ -144,3 +167,36 @@ assess:
   live_sample: 1.0                 # 0..1 share of live calls recorded
   slow_ms: 8000                    # p50 above this = verdict "slow"
   window_s: 86400                  # report window (default: last 24h)
+
+# ---- v0.5 console + automation -------------------------------------------
+ui:
+  skin: a                          # console theme a|b|c|d, saved on the server
+                                   # (a new browser or a private window keeps it)
+
+discover:
+  on_add: true                     # adding a provider probes it by itself
+  apply_aliases: true              # ...and publishes the models it found
+  auto_assess: true                # ...and measures them right away
+  concurrency: 8
+  timeout: 30
+  probe_params: true               # temperature/tools/response_format support
+  probe_stream: true
+  max_models: 200
+  fresh_seconds: 900              # 控制台进「提供商与大模型」时，超过此时长未探测的提供商自动补探
+
+tune:
+  enabled: true                    # weight/priority come from measurement
+  interval_s: 600                  # re-rank every 10 minutes
+  window_s: 86400                  # from the last 24h of traffic + probes
+  min_samples: 3                   # thinner evidence is shrunk toward neutral
+  persist: false                   # true = also write the numbers into this file
+  priority_spread: 10
+  weight_spread: 10
+
+extensions:                        # 总设置 → 扩展程序：已导入的扩展程序 bundle（由界面写入）
+  - name: smsc                     # asset/extension.json 里的 name
+    title: SMSC 网络平面面板
+    path: C:/UserSpace/EthanYan/Developin/smsc
+    panel: panel.html              # 相对 bundle 的 asset/ 目录，不许越界
+    version: "1.0"
+    verified: true                 # 只是备忘：每次读取都按 asset/SMSocket.identity 重算

@@ -96,6 +96,7 @@ class Assessor:
         self._task: asyncio.Task | None = None
         self._probing: int = 0          # suppress live mirroring during a probe
         self._running: bool = False
+        self.tuner = None          # autotune.AutoTuner, set by State.build_tuner
 
     # -- surface ------------------------------------------------------------
     @property
@@ -236,6 +237,14 @@ class Assessor:
             self._running = False
             self.progress["status"] = "done"
             self.progress["finished"] = time.time()
+        # the sweep just ended, so this is the freshest evidence we will have:
+        # hand it straight to the tuner instead of waiting for the next timer
+        t = getattr(self, "tuner", None)
+        if t is not None:
+            try:
+                t.apply()
+            except Exception as e:                            # noqa: BLE001
+                log.warning("autotune after sweep failed: %s", e)
         return dict(self.progress)
 
     def sweep_now(self, models=None, egress=None, concurrency=None) -> asyncio.Task:

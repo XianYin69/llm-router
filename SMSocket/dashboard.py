@@ -18,6 +18,8 @@ header{padding:12px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap
 h1{font-size:17px;margin:0;font-weight:600;white-space:nowrap;text-shadow:var(--glow)}
 main{padding:14px 18px 34px;max-width:1220px;margin:0 auto;display:grid;grid-template-columns:1fr;gap:12px;align-items:start}
 h2{font-size:12px;letter-spacing:.08em;margin:18px 0 6px;font-weight:700;color:var(--h2);text-shadow:var(--glow)}
+h3{font-size:11px;letter-spacing:.07em;margin:14px 0 5px;font-weight:600;color:var(--muted)}
+.extnote{font-size:11px;color:var(--muted);margin:0 0 4px}
 table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden;
  background:var(--glass);backdrop-filter:blur(var(--blur)) saturate(var(--sat));-webkit-backdrop-filter:blur(var(--blur)) saturate(var(--sat));
  border:1px solid var(--edge);border-radius:var(--rad);box-shadow:var(--drop),var(--bevel)}
@@ -50,6 +52,19 @@ button:active{transform:translateY(1px);box-shadow:var(--pressed)}
  background:var(--warn);color:var(--warnfg);border:1px solid var(--warnedge);box-shadow:var(--drop),var(--bevel)}
 #msg:not(:empty){display:block}
 td.empty{text-align:center;font-weight:600;padding:16px;color:var(--muted);background:var(--empty)}
+tr.pmhead{cursor:pointer}
+tr.pmhead:hover td{background:var(--hover,rgba(127,127,127,.12))}
+tr.pmhead.stale td{box-shadow:inset 3px 0 0 var(--warn)}
+.pmcaret{display:inline-block;width:14px;font-weight:700;opacity:.7}
+table.pmsub{margin:0;width:100%}
+tr.pmsub td,tr.pmcols td{padding:0 0 10px 22px;background:transparent;border:0}
+.pmchip{display:inline-block;font-size:11px;font-weight:600;padding:2px 7px;margin:1px 3px 1px 0;
+ border-radius:9px;border:1px solid var(--edge);background:var(--empty);color:var(--muted)}
+.pmchip.ok{background:var(--ok,rgba(60,180,110,.22));color:var(--okfg,inherit)}
+.pmchip.no{background:var(--bad,rgba(200,80,80,.22));color:var(--badfg,inherit)}
+.pmchip.warn{background:var(--warn,rgba(220,170,60,.22));color:var(--warnfg,inherit)}
+.pmchip.off{opacity:.55;border-style:dashed}
+.pmchips{max-width:420px}
 .side{display:contents}
 ::-webkit-scrollbar{width:15px;height:15px}
 ::-webkit-scrollbar-track{background:var(--track);border-radius:8px;box-shadow:var(--inset)}
@@ -207,9 +222,26 @@ _NET = """
 .netpanel table{width:100%;font-size:12px}
 .netpanel .muted{opacity:.65;font-size:11px}
 """
-CSS = _BASE + _A + _B + _C + _D + _NAV + _NET
+_EXT = """
+/* 扩展程序：导入区 + 已挂载条目（自带面板 iframe） */
+.extitem{border:1px solid var(--edge);border-radius:var(--rad);padding:10px 12px;margin:10px 0;
+ background:var(--glass);box-shadow:var(--drop),var(--bevel)}
+.extitem h4{margin:0 0 4px;font-size:13px;font-weight:700;display:flex;gap:7px;
+ align-items:center;flex-wrap:wrap;color:var(--h2)}
+.extchip{font:11px/1.5 ui-monospace,Consolas,monospace;font-weight:600;padding:1px 7px;
+ border-radius:9px;border:1px solid var(--edge);background:var(--empty);color:var(--muted)}
+.extchip.ok{background:var(--ok,rgba(60,180,110,.22));color:var(--okfg,inherit)}
+.extchip.bad{background:var(--bad,rgba(200,80,80,.22));color:var(--badfg,inherit)}
+.extpath{font:11px/1.5 ui-monospace,Consolas,monospace;color:var(--muted);word-break:break-all}
+iframe.extpanel{display:block;width:100%;min-height:380px;border:1px solid var(--edge);
+ border-radius:var(--rad);background:var(--bg);margin-top:8px}
+#x_path{min-width:320px;background:var(--well);box-shadow:var(--inset)}
+"""
+CSS = _BASE + _A + _B + _C + _D + _NAV + _NET + _EXT
 JS = """
+const CUR=__CUR__;const SYM=__SYM__;
 const K=()=>document.getElementById('key').value.trim();
+function saveKey(){try{localStorage.setItem('SMSocket.key',K())}catch(e){}}
 const hdr=()=>K()?{Authorization:'Bearer '+K()}:{};
 const L={alias:'别名',calls:'调用数',tokens:'词元数',cost:'费用',provider:'提供方',key:'密钥',
  ok:'可用',fails:'失败数',cooldown_left:'冷却剩余',ts:'时间',status:'状态',ms:'耗时',
@@ -231,18 +263,17 @@ async function send(u,m,b){const r=await fetch(u,{method:m,headers:Object.assign
   throw new Error(msg)}return d}
 """
 JS += """
-const PAGES=['overview','usage','providers','socket','discover','settings'];
+const PAGES=['overview','usage','providers','socket','settings'];
 const PKEY='SMSocket.page';
 function go(p){if(PAGES.indexOf(p)<0)p='overview';
  document.querySelectorAll('.page').forEach(el=>el.classList.toggle('on',el.id==='page-'+p));
  document.querySelectorAll('.navbtn').forEach(b=>b.classList.toggle('on',b.dataset.p===p));
  try{localStorage.setItem(PKEY,p)}catch(e){}
  if(location.hash!=='#'+p)try{history.replaceState(null,'','#'+p)}catch(e){}
- if(p==='providers')loadConfig();
+ if(p==='providers'){loadConfig();loadPM(true)}
  if(p==='socket'){loadSocket();renderStack({});loadReach();tickSocket()}
- if(p==='discover'){loadProvidersForProbe();loadCatalog()}
 
- if(p==='settings'){loadSelf();loadSettings()}}
+ if(p==='settings'){loadSelf();loadSettings();loadClash();loadTune();loadTuneScores();loadExts()}}
 let SELF={},REVEAL=false;
 function paintSelf(){document.getElementById('baseurl').textContent=SELF.base_url||'-';
  document.getElementById('apikey').textContent=REVEAL?(SELF.key||''):(SELF.key_masked||'-');
@@ -252,7 +283,11 @@ function paintSelf(){document.getElementById('baseurl').textContent=SELF.base_ur
  if(h)h.textContent='base_url = '+(SELF.base_url||location.origin+'/v1')+
   String.fromCharCode(10)+'model    = <取自 /v1/models 的别名>'+
   String.fromCharCode(10)+'api_key  = '+(REVEAL?(SELF.key||''):(SELF.key_masked||''))+
-  String.fromCharCode(10)+'密钥文件 = '+(SELF.key_file||'-')}
+  String.fromCharCode(10)+'对话 API = '+(SELF.base_url||location.origin+'/v1')+'/chat/completions'+
+  String.fromCharCode(10)+'响应 API = '+(SELF.base_url||location.origin+'/v1')+'/responses'+
+  String.fromCharCode(10)+'密钥文件 = '+(SELF.key_file||'-')+
+  String.fromCharCode(10)+'提示：本机浏览器打开控制台自动免密钥（会话 Cookie），'+
+  '外部程序仍需用 api_key；主题与设置自动保存在服务端'}
 async function loadSelf(){try{SELF=await j('/admin/self');REVEAL=false;paintSelf()}
  catch(e){SELF={};document.getElementById('baseurl').textContent='需主密钥';
   document.getElementById('apikey').textContent='需主密钥'}}
@@ -293,15 +328,20 @@ async function refresh(){toast('');
  }catch(e){toast('数据加载失败 · '+e.message)}}
 """
 JS += """
-let CFG={providers:[]},EDIT='';
+let CFG={providers:[]},EDIT='',DER={};
 function provRow(p){const b=(a,t)=>'<button data-a='+a+'>'+t+'</button>';
  return '<tr data-n='+esc(p.name)+'><td><b>'+esc(p.name)+'</b></td><td>'+esc(p.base_url)+
   '</td><td>'+esc(p.style)+'</td><td>'+keyCell(p)+
-  '</td><td>'+esc(p.priority)+' / '+esc(p.weight)+'</td><td>'+esc(p.timeout)+' / '+esc(p.max_rpm||0)+
+  '</td><td>'+provRank(p)+'</td><td>'+esc(p.timeout)+' / '+esc(p.max_rpm||0)+
   '</td><td>'+(p.enabled===false?'停用':'启用')+'</td><td>'+b('edit','编辑')+b('key','加密钥')+
   b('del','删除')+'</td></tr>'}
+function provRank(p){const d=DER[p.name];
+ if(!d)return esc(p.priority)+' / '+esc(p.weight);
+ return '<b>'+esc(d.priority)+' / '+esc(d.weight)+'</b>'+
+  ' <span class=muted title="由实测推导（日常对话 + 定时探测）">自动</span>'}
 async function loadConfig(){try{const [c,p]=await Promise.all([j('/admin/config'),j('/pool')]);
-  CFG=c;const rows=c.providers||[];
+  CFG=c;const rows=c.providers||[];DER={};
+  (p.slots||[]).forEach(x=>{if(x.auto)DER[x.provider]={priority:x.priority,weight:x.weight}});
   const hd='<tr><th>名称</th><th>基础URL</th><th>协议</th><th>密钥（已掩码）</th><th>优先级/权重</th>'+
    '<th>超时/RPM</th><th>状态</th><th>操作</th></tr>';
   document.getElementById('provs').innerHTML=hd+
@@ -314,16 +354,20 @@ const lines=s=>String(s||'').split(String.fromCharCode(10)).map(x=>x.trim()).fil
 function formBody(){return {name:gv('p_name'),base_url:gv('p_url'),style:gv('p_style'),
  models:mapParse(gv('p_models')),embeddings:mapParse(gv('p_emb')),
  priority:+gv('p_prio')||0,weight:+gv('p_w')||1,timeout:+gv('p_to')||120,max_rpm:+gv('p_rpm')||0,
- enabled:document.getElementById('p_on').checked}}
+ enabled:document.getElementById('p_on').checked,
+ auto:document.getElementById('p_auto').checked}}
 function fillForm(p){['name|p_name','base_url|p_url','style|p_style'].forEach(x=>{const [k,id]=x.split('|');
  document.getElementById(id).value=p[k]||''});
  document.getElementById('p_models').value=Object.keys(p.models||{}).map(k=>k+'='+p.models[k]).join(',');
  document.getElementById('p_emb').value=Object.keys(p.embeddings||{}).map(k=>k+'='+p.embeddings[k]).join(',');
  document.getElementById('p_prio').value=p.priority;document.getElementById('p_w').value=p.weight;
  document.getElementById('p_to').value=p.timeout;document.getElementById('p_rpm').value=p.max_rpm||0;
- document.getElementById('p_on').checked=p.enabled!==false;document.getElementById('p_keys').value=''}
+ document.getElementById('p_on').checked=p.enabled!==false;
+ document.getElementById('p_auto').checked=p.auto!==false;
+ document.getElementById('p_keys').value=''}
 function cancelEdit(){EDIT='';document.getElementById('pf').reset();
  document.getElementById('p_on').checked=true;
+ document.getElementById('p_auto').checked=true;
  document.getElementById('p_submit').textContent='新增提供方';
  document.getElementById('p_note').textContent=''}
 async function submitP(){const b=formBody();
@@ -331,8 +375,8 @@ async function submitP(){const b=formBody();
  try{if(EDIT){await send('/admin/providers/'+encodeURIComponent(EDIT),'PATCH',b);
    toast('已更新提供方 '+EDIT);cancelEdit()}
   else{b.keys=lines(gv('p_keys'));await send('/admin/providers','POST',b);
-   toast('已新增提供方 '+b.name);cancelEdit()}
-  await loadConfig()}catch(e){toast('保存失败 · '+e.message)}}
+   toast('已新增提供方 '+b.name+' · 网关正在自动探测其模型');cancelEdit()}
+  await loadConfig();await loadPM(true)}catch(e){toast('保存失败 · '+e.message)}}
 """
 JS += """
 function keyCell(p){const ks=p.keys||[];
@@ -340,12 +384,12 @@ function keyCell(p){const ks=p.keys||[];
   '<button data-a=delkey data-i='+i+'>×</button></span>').join(' ')}
 async function addKeyTo(n){const v=window.prompt('为提供方 '+n+' 追加一把 API Key（sk-…）：');
  if(!v)return;try{await send('/admin/providers/'+encodeURIComponent(n)+'/keys','POST',{key:v.trim()});
-  toast('已为 '+n+' 追加密钥');await loadConfig()}catch(e){toast('追加失败 · '+e.message)}}
+  toast('已为 '+n+' 追加密钥');await loadConfig();await loadPM(true)}catch(e){toast('追加失败 · '+e.message)}}
 async function delKey(n,i){try{await send('/admin/providers/'+encodeURIComponent(n)+'/keys/'+i,'DELETE');
-  toast('已删除 '+n+' 的第 '+(+i+1)+' 把密钥');await loadConfig()}catch(e){toast('删除密钥失败 · '+e.message)}}
+  toast('已删除 '+n+' 的第 '+(+i+1)+' 把密钥');await loadConfig();await loadPM(false)}catch(e){toast('删除密钥失败 · '+e.message)}}
 async function delProv(n){if(!window.confirm('确认删除提供方 '+n+' ？此操作写回 config.yaml'))return;
  try{await send('/admin/providers/'+encodeURIComponent(n),'DELETE');toast('已删除提供方 '+n);
-  if(EDIT===n)cancelEdit();await loadConfig()}catch(e){toast('删除失败 · '+e.message)}}
+  if(EDIT===n)cancelEdit();await loadConfig();await loadPM(false)}catch(e){toast('删除失败 · '+e.message)}}
 function editProv(n){const p=(CFG.providers||[]).filter(x=>x.name===n)[0];if(!p)return;
  EDIT=n;fillForm(p);document.getElementById('p_submit').textContent='保存修改';
  document.getElementById('p_note').textContent='正在编辑：'+n+'（密钥请用下方按钮增删）';
@@ -363,10 +407,11 @@ async function saveGlobals(){const body={listen:gv('g_listen'),strategy:gv('g_st
 """
 JS += """
 const SKIN_KEY='SMSocket.skin';
-function setSkin(k){if(!/[abcd]/.test(k))k='a';
+function setSkin(k,save){if(!/[abcd]/.test(k))k='a';
  document.body.className='skin-'+k;
  try{localStorage.setItem(SKIN_KEY,k)}catch(e){}
- document.querySelectorAll('.skinbtn').forEach(b=>b.classList.toggle('on',b.dataset.k===k))}
+ document.querySelectorAll('.skinbtn').forEach(b=>b.classList.toggle('on',b.dataset.k===k));
+ if(save!==false){try{send('/admin/ui','PUT',{skin:k}).catch(()=>{})}catch(e){}}}
 async function loadSettings(){try{const c=await j('/admin/config');CFG=c;
  document.getElementById('g_listen').value=c.listen||'';
  document.getElementById('g_strategy').value=c.strategy||'priority';
@@ -383,7 +428,9 @@ async function loadSettings(){try{const c=await j('/admin/config');CFG=c;
  document.getElementById('g_slots').textContent=c.slots;
  document.getElementById('g_models').textContent=(c.models||[]).join(', ')||'无';
  }catch(e){toast('设置加载失败 · '+e.message)}}
-document.addEventListener('click',ev=>{const b=ev.target.closest('button[data-a]');
+document.addEventListener('click',ev=>{const h=ev.target.closest('tr.pmhead');
+ if(h&&!ev.target.closest('button')){togglePM(h.dataset.n);return}
+ const b=ev.target.closest('button[data-a]');
  if(!b)return;const tr=b.closest('tr[data-n]');if(!tr)return;const n=tr.dataset.n;
  const a=b.dataset.a;
  if(a==='edit')editProv(n);
@@ -487,11 +534,14 @@ async function pollJob(){if(!LASTJOB){toast('还没有异步作业，先用「�
 JS += """
 // ---- 计费货币 ------------------------------------------------------------
 function optList(id,arr,cur){const s=document.getElementById(id);if(!s)return;
- s.innerHTML=(arr||[]).map(c=>'<option value='+c+'>'+c+'</option>').join('');
- if(cur)s.value=cur}
-function fillBilling(b){b=b||{};const cs=Object.keys(b.rates||{}).sort();
+ const list=(arr&&arr.length)?arr:CUR;
+ s.innerHTML=list.map(c=>'<option value='+c+'>'+c+(SYM[c]?' '+SYM[c]:'')+'</option>').join('');
+ if(cur&&list.indexOf(cur)>=0)s.value=cur}
+function fillBilling(b){b=b||{};let cs=Object.keys(b.rates||{}).sort();
+ if(!cs.length)cs=CUR;                 // an unauthenticated or empty table
  optList('b_cur',cs,b.currency||'USD');optList('b_base',cs,b.base||'USD');
  optList('c_from',cs,'USD');optList('c_to',cs,b.currency||'USD');
+ optList('g_cur',cs,b.currency||'USD');
  const g=(id,v)=>{const el=document.getElementById(id);if(el)el.value=v};
  g('b_prec',b.precision==null?6:b.precision);g('b_url',b.rates_url||'');
  g('b_rates',Object.keys(b.rates||{}).map(k=>k+'='+b.rates[k]).join(String.fromCharCode(10)))}
@@ -518,65 +568,82 @@ async function convertTry(){try{const d=await j('/admin/billing/convert?amount='
  catch(e){document.getElementById('c_out').textContent='换算失败'}}
 """
 JS += """
-// ---- 模型探测 ------------------------------------------------------------
-let DREP=[];
-async function loadProvidersForProbe(){try{const c=await j('/admin/config');CFG=c;
- const s=document.getElementById('d_prov');
- s.innerHTML=(c.providers||[]).map(p=>'<option value='+esc(p.name)+'>'+esc(p.name)+
-  '（'+(p.key_count||0)+' 密钥）</option>').join('')||'<option value=adhoc>无提供方</option>';
- }catch(e){toast('提供方加载失败 · '+e.message)}}
-async function startDiscover(){const body={providers:[gv('d_prov')],
- concurrency:+gv('d_conc')||8,timeout:+gv('d_to')||30,max_models:+gv('d_max')||200,
- test_prompt:gv('d_prompt'),probe_params:gv('d_params')==='1',
- probe_stream:gv('d_stream')==='1',probe_embeddings:gv('d_emb')==='1',async:1};
- const ms=gv('d_models');if(ms)body.models=ms.split(/[,;\\s]+/).filter(Boolean);
- try{const d=await send('/admin/discover','POST',body);
-  document.getElementById('d_note').textContent='探测已启动 · '+(d.providers||[]).join(',');
-  pollDiscover()}catch(e){document.getElementById('d_note').textContent='启动失败 · '+e.message}}
-async function pollDiscover(){try{const s=await j('/admin/discover/status');
- const el=document.getElementById('d_prog');
- if(s.status==='idle'){el.textContent='未开始';return}
- el.textContent=(s.status||'-')+' · 已探测 '+s.done+' 个模型 · '+s.elapsed+'s';
- if(s.report){DREP=s.report;paintDiscover();
-  document.getElementById('d_note').textContent='探测完成 · 可用 '+
-   DREP.reduce((a,p)=>a+(p.ok||0),0)+' / 共 '+DREP.reduce((a,p)=>a+(p.probed||0),0)}
- if(s.running)setTimeout(pollDiscover,1000)}catch(e){el=document.getElementById('d_prog');
-  if(el)el.textContent='进度查询失败'}}
-function paintDiscover(){const rows=[];
- DREP.forEach(p=>(p.models||[]).forEach(m=>rows.push({provider:m.provider,
-  model:m.model,ok:m.ok?'可用':'不可用',status:m.status,latency_ms:m.latency_ms,
-  context:m.context||'-',tokens:(m.usage||{}).total_tokens||0,
-  params:Object.keys(m.params||{}).filter(k=>m.params[k]==='supported').join(','),
-  rejected:Object.keys(m.params||{}).filter(k=>m.params[k]==='rejected').join(','),
-  err:(m.error||'').slice(0,80)})));
- const t=document.getElementById('dres');
- if(!rows.length){t.innerHTML='<tr><td class=empty colspan=10>还没有探测结果</td></tr>';return}
- const hd=['提供方','模型','状态','HTTP','延迟ms','上下文','测试词元','支持参数','不支持参数','错误'];
- t.innerHTML='<tr>'+hd.map(x=>'<th>'+x+'</th>').join('')+'</tr>'+rows.map(r=>
-  '<tr><td>'+esc(r.provider)+'</td><td><b>'+esc(r.model)+'</b></td><td>'+esc(r.ok)+
-  '</td><td>'+r.status+'</td><td>'+r.latency_ms+'</td><td>'+esc(r.context)+'</td><td>'+
-  r.tokens+'</td><td>'+esc(r.params)+'</td><td>'+esc(r.rejected)+'</td><td>'+
-  esc(r.err)+'</td></tr>').join('')}
-async function applyDiscovered(){try{const d=await send('/admin/models/apply','POST',
-  {providers:[gv('d_prov')]});
-  document.getElementById('d_note').textContent='别名总数 '+
-   ((d.applied||{}).models||'?')+' · 新增 '+(d.added||[]).length+' · 跳过 '+(d.skipped||[]).length;
-  loadProvidersForProbe()}
- catch(e){document.getElementById('d_note').textContent='写入失败 · '+e.message}}
-async function clearCatalog(){try{await send('/admin/models?provider='+
-  encodeURIComponent(gv('d_prov')||''),'DELETE');loadCatalog();
-  document.getElementById('d_note').textContent='缓存已清空'}catch(e){toast('清空失败 · '+e.message)}}
-async function loadCatalog(){try{const d=await j('/admin/models');
- const el=document.getElementById('d_seen');
- if(el)el.textContent=d.count+' 个模型缓存'+
-  (d.last_seen?' · 最近 '+new Date(d.last_seen*1000).toLocaleString():'');
- if(d.count&&!DREP.length){const by={};
-  (d.data||[]).forEach(m=>{(by[m.provider]=by[m.provider]||[]).push(m)});
-  DREP=Object.keys(by).map(k=>({provider:k,models:by[k],probed:by[k].length,
-   ok:by[k].filter(x=>x.ok).length}));paintDiscover()}}catch(e){}}
+// ---- 提供商与大模型：一级=提供商，二级=其模型，参数自动探测 ------------------
+let PM=[],OPEN={};
+function pmFind(n){for(const x of PM)if(x.name===n)return x;return null}
+function pmChip(t,c){return '<span class="pmchip '+(c||'')+'">'+esc(t)+'</span>'}
+function pmParams(m){
+ if(!m.probed)return pmChip('未探测','off');
+ const P=m.params||{},ks=Object.keys(P);
+ if(!ks.length)return pmChip('无参数记录','muted');
+ const sup=ks.filter(k=>P[k]==='supported'),rej=ks.filter(k=>P[k]==='rejected');
+ let out=sup.slice(0,5).map(k=>pmChip(k,'ok')).join('');
+ if(sup.length>5)out+=pmChip('+'+(sup.length-5),'muted');
+ out+=rej.slice(0,3).map(k=>pmChip(k,'no')).join('');
+ if(m.stream==='supported')out+=pmChip('流式','ok');
+ else if(m.stream==='rejected')out+=pmChip('无流式','no');
+ return out}
+function pmModelRow(n,m){
+ const st=m.ok?pmChip('可用','ok'):(m.probed?pmChip('不可用','no'):pmChip('未探测','off'));
+ const lat=m.probed?(Math.round(m.latency_ms||0)+' ms'):'-';
+ const ctx=m.context?esc(m.context):'-';
+ const al=m.alias?esc(m.alias)+' → '+esc(m.upstream):esc(m.upstream);
+ const tag=(m.embed?pmChip('嵌入','muted'):'')+(m.published?'':pmChip('未发布','warn'));
+ return '<tr class="pmrow" data-p='+esc(n)+'><td>'+al+' '+tag+'</td><td>'+st+'</td>'+
+  '<td>'+esc(lat)+'</td><td>'+esc(ctx)+'</td><td class="pmchips">'+pmParams(m)+'</td>'+
+  '<td class="muted">'+esc((m.error||'').slice(0,60))+'</td></tr>'}
+function pmProvRow(x){
+ const on=!OPEN[x.name];
+ const hd=x.model_count+' 个模型 · 可用 '+x.ok_models+
+  (x.probed_at?' · 探测于 '+new Date(x.probed_at*1000).toLocaleString():' · 尚未探测');
+ const st=x.enabled?pmChip('启用','ok'):pmChip('停用','off');
+ const err=x.error?' '+pmChip('探测报错','no'):'';
+ const why=x.probe_note?' '+pmChip(x.probe_note,'off'):'';
+ return '<tr class="pmhead'+(x.stale?' stale':'')+'" data-n='+esc(x.name)+'>'+
+  '<td><span class="pmcaret">'+(on?'▸':'▾')+'</span><b>'+esc(x.name)+'</b>'+st+err+'</td>'+
+  '<td>'+esc(x.base_url)+'</td><td>'+esc(x.style)+'</td><td>'+esc(x.key_count)+'</td>'+
+  '<td>'+esc(x.priority)+' / '+esc(x.weight)+'</td><td class="muted">'+esc(hd)+why+
+  '</td></tr>'}
+function paintPM(){
+ const t=document.getElementById('pmtree');if(!t)return;
+ if(!PM.length){t.innerHTML='<tr><td class=empty colspan=6>还没有提供方：在下方「新增 / 编辑提供方」添加，网关会自动探测其模型与参数</td></tr>';return}
+ const hd='<tr><th>提供商</th><th>基础URL</th><th>协议</th><th>密钥</th><th>优先级/权重</th><th>模型概况</th></tr>';
+ let out='';
+ PM.forEach(x=>{out+=pmProvRow(x);
+  if(OPEN[x.name]){
+   if(!x.models.length)out+='<tr class="pmsub"><td colspan=6 class=empty>未列出模型 · 网关会自动探测</td></tr>';
+   else out+='<tr class="pmcols"><td colspan=6><table class="pmsub"><tr><th>模型（别名 → 真实名）</th><th>状态</th><th>延迟</th><th>上下文</th><th>参数（自动探测）</th><th>错误</th></tr>'+
+     x.models.map(m=>pmModelRow(x.name,m)).join('')+'</table></td></tr>'}});
+ t.innerHTML=hd+out}
+async function loadPM(auto){
+ try{const d=await j('/admin/provider-models');PM=d.data||[];paintPM();
+  const el=document.getElementById('pm_seen');
+  if(el)el.textContent=(d.models||0)+' 个模型 · 最近探测 '+
+   (d.last_seen?new Date(d.last_seen*1000).toLocaleString():'无')+
+   ' · 新鲜度 '+(d.fresh_seconds||900)+'s';
+  if(auto)autoProbe()}catch(e){toast('模型树加载失败 · '+e.message)}}
+async function autoProbe(){
+ try{const d=await send('/admin/provider-models/refresh','POST',{});
+  const el=document.getElementById('pm_note');
+  if(d.queued&&d.queued.length){if(el)el.textContent='自动探测中：'+d.queued.join(', ');pollPM()}
+  else if(el)el.textContent=d.note||'全部提供方均为最新'}catch(e){}}
+function pollPM(){
+ setTimeout(async()=>{try{const s=await j('/admin/discover/status');
+  const el=document.getElementById('pm_prog');
+  if(s&&s.running){if(el)el.textContent='探测中 · 已完成 '+s.done+' 个模型 · '+s.elapsed+'s';pollPM();return}
+  if(el)el.textContent='空闲';await loadPM(false);await loadConfig()}catch(e){await loadPM(false)}}
+ ,1500)}
+function togglePM(n){OPEN[n]=!OPEN[n];paintPM()}
+async function clearPM(n){try{await send('/admin/models?provider='+encodeURIComponent(n||''),'DELETE');
+ await loadPM(true)}catch(e){toast('清空失败 · '+e.message)}}
 """
 JS += """
- (function(){let k='a';try{k=localStorage.getItem(SKIN_KEY)||'a'}catch(e){}setSkin(k);
+ (function(){let k='__SKIN__';try{k=localStorage.getItem(SKIN_KEY)||k}catch(e){}
+ setSkin(k,false);
+ try{const sv=localStorage.getItem('SMSocket.key');
+  if(sv&&!document.getElementById('key').value)document.getElementById('key').value=sv}catch(e){}
+ optList('b_cur',CUR,'USD');optList('b_base',CUR,'USD');
+ optList('c_from',CUR,'USD');optList('c_to',CUR,'USD');optList('g_cur',CUR,'USD');
  const h=(location.hash||'').replace('#','');let p=h;
  if(PAGES.indexOf(p)<0){try{p=localStorage.getItem(PKEY)||'overview'}catch(e){p='overview'}}
  go(p);loadSelf();refresh()})();
@@ -628,16 +695,111 @@ function netEgress(){const p=document.getElementById('net_p').value.trim();if(!p
 if(NET_ON){document.getElementById('net_glyph').classList.remove('off');
  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&netOpen)netPanel(false)})}
 """
+JS += """
+// ---- SMSC 网络平面（总设置 · 扩展程序条目下） ------------------------------
+function gv_set(id,v){const e=document.getElementById(id);if(e&&v!=null&&v!==undefined)e.value=v}
+function boolOf(id){const e=document.getElementById(id);return !!e&&e.value==='1'}
+async function loadClash(){try{const c=await j('/admin/config');const k=c.clash||{};
+ gv_set('c_on',k.enabled?'1':'0');gv_set('c_ctl',k.controller);gv_set('c_port',k.mixed_port);
+ gv_set('c_mode',k.mode||'auto');gv_set('c_int',k.interval);gv_set('c_health',k.health_url);
+ gv_set('c_smart',(k.smart===false?'0':'1'));gv_set('c_fail',k.fail_ratio);
+ gv_set('c_min',k.min_delay_ms);gv_set('c_groups',(k.groups||[]).join(','));
+ const pp=k.provider_proxy||{};
+ gv_set('c_pp',Object.keys(pp).map(x=>x+'='+pp[x]).join(String.fromCharCode(10)));
+ const sec=document.getElementById('c_secret');
+ if(sec){sec.value='';sec.placeholder=(k.secret&&k.secret!=='***')?
+  '已设置 · 留空＝保持原值':'留空＝不使用密钥'}
+ }catch(e){}}
+async function saveClash(){const body={clash:{enabled:boolOf('c_on'),controller:gv('c_ctl'),
+ mixed_port:+gv('c_port')||0,mode:gv('c_mode'),interval:+gv('c_int')||60,
+ health_url:gv('c_health'),smart:boolOf('c_smart'),fail_ratio:+gv('c_fail')||0.5,
+ min_delay_ms:+gv('c_min')||0,groups:gv('c_groups'),provider_proxy:gv('c_pp')}};
+ const sec=gv('c_secret');if(sec)body.clash.secret=sec;
+ try{const d=await send('/admin/config','PUT',body);
+ document.getElementById('c_note').textContent='已保存 · 出口平面 '+
+  ((d.applied||{}).net_plane?'已重建在线':'未启用');loadClash()}
+ catch(e){document.getElementById('c_note').textContent='保存失败 · '+e.message}}
+// ---- 自动调权 --------------------------------------------------------------
+async function loadTune(){try{const c=await j('/admin/config');const t=c.tune||{};
+ gv_set('t_on',(t.enabled===false?'0':'1'));gv_set('t_win',t.window_s);
+ gv_set('t_min',t.min_samples);gv_set('t_int',t.interval_s);
+ gv_set('t_persist',t.persist?'1':'0');gv_set('t_pspread',t.priority_spread);
+ gv_set('t_wspread',t.weight_spread)}catch(e){}}
+async function saveTune(){const body={tune:{enabled:boolOf('t_on'),
+ window_s:+gv('t_win')||86400,min_samples:+gv('t_min')||3,interval_s:+gv('t_int')||600,
+ persist:boolOf('t_persist'),priority_spread:+gv('t_pspread')||10,
+ weight_spread:+gv('t_wspread')||10}};
+ try{await send('/admin/config','PUT',body);
+ document.getElementById('t_note').textContent='已保存 · 按实测窗口自动重算';
+ loadTuneScores()}catch(e){document.getElementById('t_note').textContent='保存失败 · '+e.message}}
+async function applyTune(){try{const d=await send('/tune/apply','POST',{});
+ document.getElementById('t_note').textContent='已重算 · 生效 '+d.applied+' 个提供方';
+ loadTuneScores();loadConfig()}catch(e){document.getElementById('t_note').textContent='重算失败 · '+e.message}}
+async function loadTuneScores(){const t=document.getElementById('tunet');if(!t)return;
+ try{const d=await j('/tune');const rows=d.scores||[];
+ t.innerHTML=rows.length?('<tr><th>提供方</th><th>样本</th><th>成功率</th><th>p50(ms)</th>'+
+  '<th>词元/秒</th><th>优先级</th><th>权重</th><th>依据</th></tr>'+rows.map(x=>'<tr><td><b>'+
+  esc(x.provider)+'</b></td><td>'+x.samples+'</td><td>'+Math.round((x.ok_ratio||0)*100)+
+  '%</td><td>'+x.p50_ms+'</td><td>'+x.tok_s+'</td><td>'+x.priority+'</td><td>'+x.weight+
+  '</td><td>'+esc(x.note||'')+'</td></tr>').join(''))
+  :'<tr><td class=empty colspan=8>暂无实测数据（日常对话与定时探测都会写进这里）</td></tr>';
+ }catch(e){t.innerHTML=''}}
+"""
+JS += """
+// ---- 扩展程序：导入 · 识别码验证 · 自带面板挂载 --------------------------
+function smscUrl(){let c='http://127.0.0.1:9090';const e=document.getElementById('c_ctl');
+ if(e&&e.value.trim())c=e.value.trim();if(c.slice(0,4)!=='http')c='http://'+c;
+ while(c.length>1&&c.charAt(c.length-1)==='/')c=c.slice(0,-1);return c+'/ui/'}
+function openSmsc(){const u=smscUrl();let w=null;try{w=window.open(u,'_blank')}catch(e){}
+ const n=document.getElementById('c_note');if(n)n.textContent=
+  w?('已打开 SMSC 控制台 · '+u):('浏览器拦住了新窗口，请手动打开 '+u)}
+function xnote(s){const e=document.getElementById('x_note');if(e)e.textContent=s||''}
+function extPath(){const e=document.getElementById('x_path');return e?e.value.trim():''}
+async function loadExts(){try{renderExts(await j('/admin/extensions'))}
+ catch(e){const b=document.getElementById('x_list');
+  if(b)b.innerHTML='<p class="extchip bad">扩展程序读取失败 · '+esc(e.message)+'</p>'}}
+var XPATH={};
+function renderExts(d){const box=document.getElementById('x_list');if(!box)return;
+ const code=document.getElementById('x_code');if(code)code.textContent=(d&&d.identity)||'-'
+ ;const items=(d&&d.items)||[];
+ if(!items.length){box.innerHTML='<p class="extnote">尚无已导入的扩展程序</p>';return}
+ box.innerHTML=items.map(it=>{const ok=it.verified&&it.panel_ready;
+  return '<div class="extitem" data-name="'+esc(it.name)+'"><h4>'+esc(it.title||it.name)+
+   '<span class="extchip '+(ok?'ok':'bad')+'">'+(it.verified?(ok?'识别码验证通过 · 面板已挂载':'面板缺失'):'未验证')+'</span>'+
+   (it.version?'<span class="extchip">v'+esc(it.version)+'</span>':'')+'</h4>'+
+   '<div class="extpath">'+esc(it.path)+'</div>'+
+   (it.reason?'<p class="extchip bad">'+esc(it.reason)+'</p>':'')+
+   '<div class="btns"><button type="button" onclick="mountPanel(&#39;'+esc(it.name)+'&#39;)">刷新面板</button>'+
+   (it.verified?'':'<button type="button" onclick="pairPath(&#39;'+esc(it.name)+'&#39;)">配对并导入</button>')+
+   '<button type="button" onclick="removeExt(&#39;'+esc(it.name)+'&#39;)">卸载</button></div>'+
+   '<iframe id="pf-'+esc(it.name)+'" class="extpanel" title="'+esc(it.title||it.name)+' 自带面板"></iframe></div>'
+  }).join('');
+ items.forEach(it=>{XPATH[it.name]=it.path;if(it.verified&&it.panel_ready)mountPanel(it.name)})}
+async function mountPanel(name){const f=document.getElementById('pf-'+name);if(!f)return;
+ try{const r=await fetch('/admin/extensions/'+encodeURIComponent(name)+'/panel',{headers:hdr()});
+  if(!r.ok)throw new Error('面板 '+r.status);f.srcdoc=await r.text()}
+ catch(e){f.removeAttribute('srcdoc');xnote('自带面板挂载失败 · '+e.message)}}
+async function importExt(){const p=extPath();if(!p){xnote('请先填扩展程序路径');return}
+ xnote('导入中…');try{const d=await send('/admin/extensions/import','POST',{path:p});
+  xnote('识别码验证通过 · '+(d.item&&d.item.title||p)+' 的自带面板已挂到扩展程序条目');renderExts(d)}
+ catch(e){xnote('导入失败 · '+e.message);loadExts()}}
+async function pairExt(){const p=extPath();if(!p){xnote('请先填扩展程序路径');return}
+ xnote('配对中…');try{const d=await send('/admin/extensions/pair','POST',{path:p});
+  xnote('识别码已写入 '+(d.paired&&d.paired.file||'asset')+' · 验证通过，自带面板已挂载');renderExts(d)}
+ catch(e){xnote('配对失败 · '+e.message);loadExts()}}
+function pairPath(n){const e=document.getElementById('x_path');if(e)e.value=XPATH[n]||'';pairExt()}
+async function removeExt(name){try{renderExts(await send('/admin/extensions/remove','POST',{name:name}));
+  xnote('已卸载 '+name)}catch(e){xnote('卸载失败 · '+e.message)}}
+"""
 BODY = """
-<body class="skin-a">
+<body class="skin-__SKIN__">
 <header>
 <h1>SMSocket 控制台</h1>
 <div class="nav">
 <button class="navbtn" data-p="overview" onclick="go('overview')">概览</button>
 <button class="navbtn" data-p="usage" onclick="go('usage')">流量与费用</button>
-<button class="navbtn" data-p="providers" onclick="go('providers')">提供商与API</button>
+<button class="navbtn" data-p="providers" onclick="go('providers')">提供商与大模型</button>
 <button class="navbtn" data-p="socket" onclick="go('socket')">并发与批量</button>
-<button class="navbtn" data-p="discover" onclick="go('discover')">模型探测</button>
 <button class="navbtn" data-p="settings" onclick="go('settings')">总设置</button>
 </div>
 <div class="cred"><em>基础URL</em><code id="baseurl">-</code>
@@ -646,7 +808,8 @@ BODY = """
 <button id="reveal" onclick="revealKey()">显示</button>
 <button onclick="copyText(document.getElementById('apikey').textContent,' API Key')">复制</button>
 </div>
-<input id="key" type="password" size="20" placeholder="主密钥（可选）">
+<input id="key" type="password" size="20" placeholder="主密钥（本机浏览器自动免填）"
+ oninput="saveKey()">
 <button onclick="refresh()">刷新</button>
 <span>调度策略：<b id="strategy">-</b></span>
 <span id="msg"></span>
@@ -681,14 +844,22 @@ BODY += """
 """
 BODY += """
 <div class="page" id="page-providers">
-<h2>提供方列表</h2><table id="provs"></table>
+<h2>提供商与大模型（点一行展开其模型；参数由网关自动探测）</h2>
+<div class="cred"><em>自动探测</em><code id="pm_prog">空闲</code><em>缓存</em><code id="pm_seen">-</code>
+<em>说明</em><code id="pm_note">进入本页自动补探陈旧项</code>
+<button onclick="clearPM('')">清空全部缓存</button></div>
+<table id="pmtree"></table>
+<h2>提供方操作（编辑 · 密钥增删 · 删除）</h2><table id="provs"></table>
 <h2>新增 / 编辑提供方</h2>
 <form id="pf" onsubmit="submitP();return false">
 <label>名称<input id="p_name" placeholder="my-provider"></label>
 <label>基础URL<input id="p_url" placeholder="https://api.xx.com/v1"></label>
-<label>协议<select id="p_style"><option value="openai">openai</option><option value="anthropic">anthropic</option></select></label>
-<label>优先级<input id="p_prio" type="number" value="0"></label>
-<label>权重<input id="p_w" type="number" value="1"></label>
+<label>协议<select id="p_style"><option value="openai">openai · 对话API</option>
+<option value="openai-responses">openai-responses · 响应API</option>
+<option value="anthropic">anthropic</option></select></label>
+<label>优先级<input id="p_prio" type="number" value="0" title="留默认即可：网关按实测自动调权"></label>
+<label>权重<input id="p_w" type="number" value="1" title="留默认即可：网关按实测自动调权"></label>
+<label>参与自动调权<input id="p_auto" type="checkbox" checked></label>
 <label>超时(秒)<input id="p_to" type="number" value="120"></label>
 <label>最大RPM（0=不限）<input id="p_rpm" type="number" value="0"></label>
 <label>启用<input id="p_on" type="checkbox" checked></label>
@@ -705,7 +876,7 @@ BODY += """
 BODY += """
 <div class="page" id="page-settings">
 <h2>界面皮肤</h2>
-<div class="skinbar"><em>选择皮肤（存 localStorage）</em>
+<div class="skinbar"><em>选择皮肤（自动保存到服务端 + 本机浏览器）</em>
 <button class="skinbtn" data-k="a" onclick="setSkin('a')">A · Aero 玻璃</button>
 <button class="skinbtn" data-k="b" onclick="setSkin('b')">B · Fluent 云母</button>
 <button class="skinbtn" data-k="c" onclick="setSkin('c')">C · 金属玻璃</button>
@@ -721,13 +892,62 @@ BODY += """
 <label>最大并发（0=不限）<input id="g_maxc" type="number" value="0"></label>
 <label>排队等待(秒)<input id="g_qw" type="number" value="30"></label>
 <label>单提供方并发<input id="g_ppc" type="number" value="0"></label>
-<label>计费币种<input id="g_cur"></label>
+<label>计费币种<select id="g_cur"></select></label>
 <label class="wide">定价（别名=每百万prompt/每百万completion，每行一条，* 为默认）
 <textarea id="g_pricing" rows="4"></textarea></label>
 <div class="btns wide"><button type="submit">保存并热加载</button>
 <button type="button" onclick="loadSettings()">重新读取</button>
 <span>配置文件：<code id="g_path">-</code></span></div>
 </form>
+<h2>扩展程序</h2>
+<p class="extnote">SMS 的可选外部能力：关掉不影响主链路，开启后按需接管。</p>
+<h3>导入扩展程序</h3>
+<p class="extnote">扩展程序＝自带面板的目录（内含 <code>asset/</code> 文件夹）；
+<code>asset/SMSocket.identity</code> 里的识别码与本机一致才算验证通过，通过后其自带面板
+自动挂到下方「扩展程序条目」。本机识别码：<code id="x_code">-</code></p>
+<div class="btns wide">
+<label class="wide" style="flex:1 1 340px">扩展程序路径<input id="x_path"
+ placeholder="C:/UserSpace/EthanYan/Developin/smsc"></label>
+<button type="button" onclick="importExt()">导入扩展程序</button>
+<button type="button" onclick="pairExt()">配对并导入（写入识别码）</button>
+<button type="button" onclick="loadExts()">重新扫描</button>
+<span id="x_note"></span>
+</div>
+<h3>SMSC 网络平面（智能分流）</h3>
+<p class="extnote">SMSC = 本机 smsc 控制面（原「Clash 设置」）；按大陆/香港可达性决定直连或代理。</p>
+<form id="cf" onsubmit="saveClash();return false">
+<label>启用<select id="c_on"><option value="0">关</option><option value="1">开</option></select></label>
+<label>控制器 URL<input id="c_ctl" placeholder="http://127.0.0.1:9090"></label>
+<label>控制器密钥<input id="c_secret" type="password" placeholder="留空＝保持原值"></label>
+<label>混合端口<input id="c_port" type="number" value="7890"></label>
+<label>分流模式<select id="c_mode"><option value="auto">auto · 按实测选路</option>
+<option value="direct">direct · 只直连</option><option value="proxy">proxy · 只走代理</option></select></label>
+<label>探测间隔(秒)<input id="c_int" type="number" value="60"></label>
+<label>健康检查 URL<input id="c_health" placeholder="https://www.google.com/generate_204"></label>
+<label>智能分流<select id="c_smart"><option value="1">开</option><option value="0">关</option></select></label>
+<label>失败率阈值<input id="c_fail" type="number" step="0.05" value="0.5"></label>
+<label>最小延迟差(ms)<input id="c_min" type="number" value="0"></label>
+<label class="wide">代理分组（逗号分隔）<input id="c_groups" placeholder="PROXY,AI"></label>
+<label class="wide">固定出口（每行 provider=egress）<textarea id="c_pp" rows="3"></textarea></label>
+<div class="btns wide"><button type="submit">保存并重建出口平面</button>
+<button type="button" onclick="loadClash()">重新读取</button>
+<button type="button" onclick="openSmsc()">打开 SMSC</button><span id="c_note"></span></div></form>
+<h3>扩展程序条目</h3>
+<div id="x_list"><p class="extnote">尚无已导入的扩展程序</p></div>
+<h2>自动调权（权重与优先级由实测推导，无需手填）</h2>
+<form id="tf" onsubmit="saveTune();return false">
+<label>启用<select id="t_on"><option value="1">开</option><option value="0">关</option></select></label>
+<label>统计窗口(秒)<input id="t_win" type="number" value="86400"></label>
+<label>最少样本<input id="t_min" type="number" value="3"></label>
+<label>重算间隔(秒)<input id="t_int" type="number" value="600"></label>
+<label>写回配置文件<select id="t_persist"><option value="0">否 · 仅运行时生效</option>
+<option value="1">是</option></select></label>
+<label>优先级跨度<input id="t_pspread" type="number" value="10"></label>
+<label>权重跨度<input id="t_wspread" type="number" value="10"></label>
+<div class="btns wide"><button type="submit">保存调权设置</button>
+<button type="button" onclick="applyTune()">立即重算</button>
+<button type="button" onclick="loadTune()">重新读取</button><span id="t_note"></span></div></form>
+<h2>当前实测排名</h2><table id="tunet"></table>
 <h2>计费货币与汇率</h2>
 <form id="bf" onsubmit="saveBilling();return false">
 <label>显示币种<select id="b_cur"></select></label>
@@ -799,26 +1019,6 @@ BODY += """
 <span id="q_note"></span></div></form>
 <h2>批量结果</h2><table id="qres"></table>
 <h2>作业列表</h2><table id="qjobs"></table>
-</div>
-<div class="page" id="page-discover">
-<h2>探测提供商（发送测试消息获取真实模型与参数）</h2>
-<form id="df" onsubmit="startDiscover();return false">
-<label>目标<select id="d_prov"></select></label>
-<label>并发数<input id="d_conc" type="number" value="8"></label>
-<label>超时(秒)<input id="d_to" type="number" value="30"></label>
-<label>最多模型数<input id="d_max" type="number" value="200"></label>
-<label>测试提示词<input id="d_prompt" value="Reply with exactly one word: ok"></label>
-<label>指定模型（逗号分隔，留空=全部）<input id="d_models"></label>
-<label>探测参数<select id="d_params"><option value="1">是</option><option value="0">否</option></select></label>
-<label>探测流式<select id="d_stream"><option value="1">是</option><option value="0">否</option></select></label>
-<label>探测嵌入<select id="d_emb"><option value="0">否</option><option value="1">是</option></select></label>
-<div class="btns wide"><button type="submit">开始探测</button>
-<button type="button" onclick="pollDiscover()">刷新进度</button>
-<button type="button" onclick="applyDiscovered()">写入别名</button>
-<button type="button" onclick="clearCatalog()">清空缓存</button>
-<span id="d_note"></span></div></form>
-<div class="cred"><em>进度</em><code id="d_prog">未开始</code><em>缓存</em><code id="d_seen">-</code></div>
-<h2>探测结果（模型 · 可用性 · 参数）</h2><table id="dres"></table>
 </div>
 </main>
 <div class="netglyph off" id="net_glyph" title="net plane" onclick="netPanel(true)">⌁ net</div>

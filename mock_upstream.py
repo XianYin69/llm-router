@@ -50,6 +50,62 @@ async def chat(request: Request):
             "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
 
 
+@app.post("/v1/responses")
+async def responses(request: Request):
+    """The OpenAI Responses API surface (input/instructions -> output items)."""
+    if _denied(request):
+        return JSONResponse({"error": {"message": "invalid api key"}}, status_code=401)
+    payload = await request.json()
+    texts = []
+    instr = payload.get("instructions")
+    if instr:
+        texts.append(str(instr))
+    inp = payload.get("input")
+    if isinstance(inp, str):
+        texts.append(inp)
+    elif isinstance(inp, list):
+        for it in inp:
+            if isinstance(it, dict):
+                c = it.get("content")
+                texts.append(c if isinstance(c, str) else str(c))
+    reply = "hello from mock responses"
+    rid = "resp_" + "%08x" % (abs(hash(tuple(texts))) % 0xffffffff)
+    if payload.get("stream"):
+        async def gen():
+            def ev(t, o):
+                o["type"] = t
+                return "event: " + t + "\ndata: " + json.dumps(o) + "\n\n"
+            base = {"id": rid, "object": "response", "created_at": int(time.time()),
+                    "status": "in_progress", "model": payload.get("model"),
+                    "output": [], "usage": None, "error": None}
+            yield ev("response.created", {"response": base})
+            for tok in ["hello", " from", " mock responses"]:
+                yield ev("response.output_text.delta", {"delta": tok, "output_index": 0,
+                                                        "content_index": 0})
+                time.sleep(0.02)
+            done = dict(base)
+            done["status"] = "completed"
+            done["output"] = [{"type": "message", "role": "assistant",
+                               "content": [{"type": "output_text", "text": reply,
+                                            "annotations": []}]}]
+            done["usage"] = {"input_tokens": 6, "output_tokens": 4, "total_tokens": 10}
+            yield ev("response.completed", {"response": done})
+        return StreamingResponse(gen(), media_type="text/event-stream")
+    return {"id": rid, "object": "response", "created_at": int(time.time()),
+            "status": "completed", "model": payload.get("model"),
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": reply,
+                                     "annotations": []}]}],
+            "output_text": reply,
+            "usage": {"input_tokens": 6, "output_tokens": 4, "total_tokens": 10},
+            "error": None, "incomplete_details": None}
+
+
+@app.get("/v1/responses/{rid}")
+async def responses_get(rid: str):
+    return JSONResponse({"error": {"message": "mock stores nothing"}}, status_code=404)
+
+
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
     if _denied(request):

@@ -78,15 +78,30 @@ class Billing:
 
     # ---- cost --------------------------------------------------------------
     def cost(self, prompt: int, completion: int, row: dict | None,
-             pricing_currency: str | None = None) -> dict:
-        """Price a call from a pricing row -> amount in row currency + display."""
+             pricing_currency: str | None = None, cached: int = 0,
+             cache_write: int = 0) -> dict:
+        """Price a call from a pricing row -> amount in row currency + display.
+
+        `cached` tokens are billed at the row's `cache_read` rate instead of the
+        full input rate (defect #2: that rate was read into a variable and then
+        ignored, so the cache discount was structurally always 0). `cache_write`
+        uses `cache_write`/`cache_creation` when the row prices it, else the
+        input rate - never free, never invented.
+        """
         row = row or {}
         src = norm(pricing_currency or row.get("currency") or row.get("cur") or self.base)
         p = float(row.get("prompt", 0) or 0)
         c = float(row.get("completion", 0) or 0)
         cache = float(row.get("cache_read", row.get("cached", 0)) or 0)
+        cw_rate = float(row.get("cache_write", row.get("cache_creation", 0)) or 0) or p
         req = float(row.get("request", row.get("per_request", 0)) or 0)
-        amount = (prompt * p + completion * c) / 1e6 + req
+        # cached / cache-write tokens are SUBSETS of prompt: partition it so no
+        # token is priced twice (prompt = miss + hit + wt).
+        pin = max(0, int(prompt or 0))
+        hit = min(max(0, int(cached or 0)), pin)
+        wt = min(max(0, int(cache_write or 0)), pin - hit)
+        miss = pin - hit - wt
+        amount = (miss * p + hit * cache + wt * cw_rate + completion * c) / 1e6 + req
         amount = round(amount, max(self.precision, 8))
         return {"amount": amount, "currency": src,
                 "display": self.convert(amount, src), "display_currency": self.currency,

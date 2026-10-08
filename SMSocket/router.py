@@ -7,7 +7,9 @@ import time
 
 import httpx
 
+from . import egc
 from . import upstream as up
+from .upstream import RESPONSES_STYLE
 from .clash import DIRECT
 from .config import Settings
 from .concurrency import Gate, SMSocketBusy
@@ -51,6 +53,7 @@ class Router:
         self.net = net
         self.egress = egress if egress is not None else getattr(net, "registry", None)
         self.assessor = None        # assess.Assessor, set by State.attach_router
+        self.tuner = None           # autotune.AutoTuner, set by State.build_tuner
 
     def plan(self, alias: str) -> list[KeySlot]:
         cands = self.pool.candidates(alias, self.s.strategy, net=self._net())
@@ -89,23 +92,53 @@ class Router:
         return eid, self.egress.client_for(eid)
 
     def _request(self, slot: KeySlot, alias: str, payload: dict, stream: bool,
-                 client: httpx.AsyncClient | None = None) -> httpx.Request:
+                 client: httpx.AsyncClient | None = None, lane: str = ""):
+        """Build the outbound request **through the EGC standard layer**.
+
+        Returns ``(request, egc.Wire)``. This is the one choke point every egress
+        path passes, so it is where the spec's red line is enforced: EGC runs
+        after `build_payload` (i.e. after DSM materialisation upstream) and
+        before serialisation. The caller must feed `wire.ids` back through
+        `egc.restore_ids()` on the response, or tool-call ids come home
+        shortened and the tool loop breaks.
+        """
         p = slot.provider
         body = up.build_payload(p, payload, self.pool.upstream_model(slot, alias))
         if stream and p.style != "anthropic":
             body["stream"] = True
-            body.setdefault("stream_options", {"include_usage": True})
-        return (client or self.http).build_request(
+            if p.style != RESPONSES_STYLE:
+                body.setdefault("stream_options", {"include_usage": True})
+        wire = egc.egress(body, style="anthropic" if p.style == "anthropic" else "openai",
+                          lane=lane)
+        # 关档时 wire is None：交回 httpx 的 json=，出网字节与接 EGC 之前逐字节相同
+        payload_kw = ({"content": wire.wire} if wire.wire is not None else {"json": body})
+        return ((client or self.http).build_request(
             "POST", up.chat_url(p), headers=up.headers(p, slot.key),
-            json=body, timeout=p.timeout)
+            timeout=p.timeout, **payload_kw), wire)
 
+
+    def _detail(self, alias: str, prompt: int, completion: int, cached: int,
+                cache_write: int) -> dict:
+        """cost_detail with the DSM cache args, tolerating 3-arg test stubs."""
+        try:
+            return self.s.cost_detail(alias, prompt, completion, cached, cache_write)
+        except TypeError:
+            return self.s.cost_detail(alias, prompt, completion)
 
     def _account(self, slot: KeySlot, alias: str, status: int, t0: float,
                  usage: dict | None, stream: int, error: str = "", upstream: str = "",
-                 egress: str = "") -> None:
+                 egress: str = "", dsm: dict | None = None) -> None:
         u = usage or {}
-        cd = self.s.cost_detail(alias, int(u.get("prompt_tokens", 0) or 0),
-                                int(u.get("completion_tokens", 0) or 0))
+        pd = u.get("prompt_tokens_details") or {}
+        cd_ = u.get("completion_tokens_details") or {}
+        prompt = int(u.get("prompt_tokens", 0) or 0)
+        completion = int(u.get("completion_tokens", 0) or 0)
+        cached = int(pd.get("cached_tokens", u.get("cache_read", 0)) or 0)
+        cw = int(pd.get("cache_creation_input_tokens", u.get("cache_write", 0)) or 0)
+        reason = int(cd_.get("reasoning_tokens", u.get("reasoning_tokens", 0)) or 0)
+        answer = max(0, completion - reason)
+        d = dsm or {}
+        cd = self._detail(alias, prompt, completion, cached, cw)
         self.usage.log(ts=time.time(), alias=alias, upstream=upstream or alias,
                        provider=slot.provider.name, key=slot.label.split("/")[-1],
                        status=status, ms=round((time.time() - t0) * 1000, 1),
@@ -115,7 +148,11 @@ class Router:
                        stream=stream, error=error[:300],
                        cost=cd["amount"], cost_currency=cd["currency"],
                        cost_display=cd["display"],
-                       display_currency=cd["display_currency"], egress=egress)
+                       display_currency=cd["display_currency"], egress=egress,
+                       sid=str(d.get("sid") or ""), cid=str(d.get("cid") or ""),
+                       lane=str(d.get("lane") or ""), skill=str(d.get("skill") or ""),
+                       **{"in": prompt, "out_reason": reason, "out_answer": answer,
+                          "cache_read": cached, "cache_write": cw})
         a = getattr(self, "assessor", None)
         if a is not None:
             # "daily conversation" evaluation: real traffic is the sample, so
@@ -138,10 +175,13 @@ class Router:
             eid, client = self.pick_egress(slot.provider.name)
             if egress_out is not None:
                 egress_out["egress"] = eid
+            emb = dict(payload, model=up_model)
+            w = egc.egress(emb, style="openai")
             req = client.build_request("POST", up.embed_url(slot.provider),
                                        headers=up.headers(slot.provider, slot.key),
-                                       json=dict(payload, model=up_model),
-                                       timeout=slot.provider.timeout)
+                                       timeout=slot.provider.timeout,
+                                       **({"content": w.wire} if w.wire is not None
+                                          else {"json": emb}))
             try:
                 r = await client.send(req)
                 lease.release(error=r.status_code >= 400)
@@ -166,7 +206,7 @@ class Router:
         raise last or UpstreamError(502, "all embedding upstreams failed")
 
     async def complete(self, payload: dict, egress_out: dict | None = None,
-                       force_egress: str = "") -> dict:
+                       force_egress: str = "", dsm: dict | None = None) -> dict:
         alias = str(payload.get("model") or "")
         last: UpstreamError | None = None
         for slot in self.plan(alias):
@@ -176,7 +216,9 @@ class Router:
             if egress_out is not None:
                 egress_out["egress"] = eid
             try:
-                r = await client.send(self._request(slot, alias, payload, False, client))
+                req, wire = self._request(slot, alias, payload, False, client,
+                                          lane=str((dsm or {}).get("lane") or ""))
+                r = await client.send(req)
                 lease.release(error=r.status_code >= 400)
                 if r.status_code >= 400:
                     slot.note_fail(self.s.cooldown)
@@ -186,27 +228,32 @@ class Router:
                     last = UpstreamError(502, f"{slot.label}: {detail}", slot,
                                          upstream_status=r.status_code)
                     self._account(slot, alias, r.status_code, t0, None, 0, str(detail),
-                                  egress=eid)
+                                  egress=eid, dsm=dsm)
                     log.warning("failover from %s (%s)", slot.label, detail)
                     continue
                 body = r.json()
                 if slot.provider.style == "anthropic":
                     body = up.from_anthropic(body, alias)
+                elif slot.provider.style == RESPONSES_STYLE:
+                    body = up.from_responses(body, alias)
+                egc.restore_ids(body, wire.ids)   # R6 反查：短 id 换回原 id（工具循环靠它）
                 slot.note_ok()
                 body["model"] = alias
                 self._account(slot, alias, r.status_code, t0, body.get("usage"), 0,
-                              upstream=self.pool.upstream_model(slot, alias), egress=eid)
+                              upstream=self.pool.upstream_model(slot, alias), egress=eid,
+                              dsm=dsm)
                 return body
             except (httpx.RequestError, ValueError) as e:
                 lease.release(error=True)
                 slot.note_fail(self.s.cooldown)
                 last = UpstreamError(502, f"{slot.label}: {type(e).__name__}: {e}", slot)
-                self._account(slot, alias, 502, t0, None, 0, str(e), egress=eid)
+                self._account(slot, alias, 502, t0, None, 0, str(e), egress=eid, dsm=dsm)
                 log.warning("upstream %s error: %s", slot.label, e)
         raise last or UpstreamError(502, "all upstreams failed")
 
 
-    async def open_stream(self, payload: dict, force_egress: str = ""):
+    async def open_stream(self, payload: dict, force_egress: str = "",
+                          dsm: dict | None = None):
         """Try candidates until one opens a stream; returns (slot, alias, t0, response).
 
         The chosen egress travels on the response (`_sms_egress`), the same way
@@ -220,8 +267,10 @@ class Router:
             lease = await self.gate.acquire(alias, slot.provider.name)
             eid, client = self.pick_egress(slot.provider.name, force_egress)
             try:
-                r = await client.send(self._request(slot, alias, payload, True, client),
-                                      stream=True)
+                req, wire = self._request(slot, alias, payload, True, client,
+                                          lane=str((dsm or {}).get("lane") or ""))
+                r = await client.send(req, stream=True)
+                r._sms_egc = wire                 # ids must survive to wrap_stream
                 if r.status_code >= 400:
                     await r.aread()
                     lease.release(error=True)
@@ -234,6 +283,7 @@ class Router:
                     continue
                 r._sms_lease = lease          # released when the stream ends
                 r._sms_egress = eid           # echoed as x-socket-egress
+                r._sms_dsm = dsm or {}        # attribution for the stream's account row
                 return slot, alias, t0, r
             except httpx.RequestError as e:
                 lease.release(error=True)
@@ -243,11 +293,23 @@ class Router:
 
     async def wrap_stream(self, slot: KeySlot, alias: str, t0: float, r: httpx.Response):
         usage: dict = {}
+        # R6 反查表随请求存活：流里每个 tool_calls delta 都要换回原 id
+        idmap = getattr(getattr(r, "_sms_egc", None), "ids", None)
         try:
             if slot.provider.style == "anthropic":
                 async for c in up.anthropic_stream_to_openai(r.aiter_bytes(), alias):
                     if c.get("usage"):
                         usage = c["usage"]
+                    egc.restore_ids(c, idmap)
+                    yield up.sse(c)
+                yield b"data: [DONE]\n\n"
+            elif slot.provider.style == RESPONSES_STYLE:
+                # Responses SSE -> chat.completion.chunk, so a chat client
+                # never learns which surface the upstream actually has.
+                async for c in up.responses_stream_to_openai(r.aiter_bytes(), alias):
+                    if c.get("usage"):
+                        usage = c["usage"]
+                    egc.restore_ids(c, idmap)
                     yield up.sse(c)
                 yield b"data: [DONE]\n\n"
             else:
@@ -256,11 +318,11 @@ class Router:
                     buf += raw
                     while b"\n\n" in buf:
                         evt, buf = buf.split(b"\n\n", 1)
-                        out, u = _normalize_event(evt, alias)
+                        out, u = _normalize_event(evt, alias, idmap)
                         usage = u or usage
                         yield out
                 if buf.strip():
-                    out, u = _normalize_event(buf, alias)
+                    out, u = _normalize_event(buf, alias, idmap)
                     usage = u or usage
                     yield out
         finally:
@@ -271,10 +333,11 @@ class Router:
             slot.note_ok()
             self._account(slot, alias, 200, t0, usage, 1,
                           upstream=self.pool.upstream_model(slot, alias),
-                          egress=getattr(r, "_sms_egress", ""))
+                          egress=getattr(r, "_sms_egress", ""),
+                          dsm=getattr(r, "_sms_dsm", None))
 
 
-def _normalize_event(evt: bytes, alias: str) -> tuple:
+def _normalize_event(evt: bytes, alias: str, ids=None) -> tuple:
     """Rewrite one SSE event: guarantee object + public model, sniff usage."""
     out, usage = [], {}
     for line in evt.split(b"\n"):
@@ -293,6 +356,8 @@ def _normalize_event(evt: bytes, alias: str) -> tuple:
             continue
         obj.setdefault("object", "chat.completion.chunk")
         obj["model"] = alias
+        if ids:
+            egc.restore_ids(obj, ids)
         if obj.get("usage"):
             usage = obj["usage"]
         out.append(b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8"))
